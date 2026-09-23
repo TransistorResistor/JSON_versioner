@@ -1,0 +1,15 @@
+# Local data, snapshots, and caches
+json_history/
+*_history/
+test_records/
+pages_schema/
+test_datasets/
+Json Demo/
+my_records/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.streamlit/secrets.toml
+.env
+.env.*

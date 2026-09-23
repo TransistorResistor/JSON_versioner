@@ -1,0 +1,15 @@
+{
+  "id_fields": ["modelID", "id", "record_id"],
+  "group_fields": ["systemGroup"],
+  "type_fields": ["systemType"],
+  "url_prefix": "",
+  "updated_at_fields": ["updated_at", "updatedDate"],
+  "ignore_fields": ["export_timestamp", "_comment"],
+  "ignore_paths": ["$.parametrics[].parameterDescr"],
+  "unordered_arrays": ["$.tags", "$.categories"],
+  "array_keys": {"$.descriptions": "descrType", "$.parametrics": "parameter", "$.aliases": "alias", "$.codes": "code", "$.media": "mediaID"},
+  "important_fields": {"$.status": 3, "$.owner": 2, "$.classification": 3},
+  "change_thresholds": {"tiny": 0.02, "small": 0.10, "medium": 0.40},
+  "schema_field_fraction": 0.9,
+  "invalid_json": "abort"
+}
