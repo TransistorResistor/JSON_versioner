@@ -11,10 +11,15 @@ import json
 import re
 import sqlite3
 import sys
+from contextlib import ExitStack
 from pathlib import Path
-from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
-from urllib.request import Request, urlopen
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from storage import StagedRecords, PreviousRecords, put_blob, compact_storage
 
 ROOT = Path(__file__).resolve().parent
 MISSING = object()
@@ -100,7 +105,9 @@ def change_time(kind, reported, previous_time, snapshot_time):
 
 
 def leaves(value, path='$'):
-    if isinstance(value, dict):
+    if isinstance(value, (dict, list)) and not value:
+        yield path, value
+    elif isinstance(value, dict):
         for key, child in value.items():
             yield from leaves(child, f'{path}.{key}')
     elif isinstance(value, list):
@@ -120,7 +127,7 @@ def word_edits(old, new):
 
 
 def changes(old, new, cfg, path='$'):
-    if old is not MISSING and new is not MISSING and old == new:
+    if old is not MISSING and new is not MISSING and canonical(old) == canonical(new):
         return
     if isinstance(old, dict) and isinstance(new, dict):
         for key in sorted(old.keys() | new.keys()):
@@ -168,6 +175,11 @@ def database(path):
         schema_only INTEGER, word_edits INTEGER, PRIMARY KEY(snapshot_id, record_id, json_path));
     CREATE INDEX IF NOT EXISTS ix_changes_record ON record_changes(record_id);
     CREATE INDEX IF NOT EXISTS ix_fields_path ON field_changes(json_path);''')
+    db.executescript('''CREATE TABLE IF NOT EXISTS record_blobs (
+        hash TEXT PRIMARY KEY, payload BLOB NOT NULL, raw_bytes INTEGER NOT NULL,
+        classification_json TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS ix_fields_record ON field_changes(record_id, snapshot_id);
+    CREATE INDEX IF NOT EXISTS ix_records_hash ON records(hash);''')
     columns = {row[1] for row in db.execute('PRAGMA table_info(record_changes)')}
     for name in ('event_at', 'event_basis', 'reported_updated_at'):
         if name not in columns:
@@ -179,8 +191,8 @@ def database(path):
     return db
 
 
-def scan(source, cfg):
-    result = {}
+def scan(source, cfg, result=None):
+    result = {} if result is None else result
     errors = []
     files = sorted(source.rglob('*.json'))
     for number, file in enumerate(files, 1):
@@ -276,9 +288,30 @@ def source_entries(source: Path, column: str | None):
     return values
 
 
-def scan_urls(source, cfg, template, column, timeout, prefix=None):
+class HTTPSession(requests.Session):
+    """Reject plaintext requests, including redirects, before sending them."""
+
+    def send(self, request, **kwargs):
+        if urlparse(request.url).scheme != 'https':
+            raise ValueError('HTTPS is required, including redirect destinations')
+        return super().send(request, **kwargs)
+
+
+def https_session():
+    session = HTTPSession()
+    session.headers.update({'Accept': 'application/json', 'User-Agent': 'json-versioner/2.0'})
+    retries = Retry(total=3, backoff_factor=.5, allowed_methods={'GET'},
+                    status_forcelist=(429, 500, 502, 503, 504))
+    session.mount('https://', HTTPAdapter(max_retries=retries))
+    return session
+
+
+def scan_urls(source, cfg, template, column, timeout, prefix=None, result=None, session=None):
+    if session is None:
+        with https_session() as owned_session:
+            return scan_urls(source, cfg, template, column, timeout, prefix, result, owned_session)
     entries = source_entries(source, column)
-    result = {}
+    result = {} if result is None else result
     errors = []
     if template and '{modelID}' not in template and '{id}' not in template:
         raise ValueError('URL template must contain {modelID} or {id}')
@@ -295,17 +328,17 @@ def scan_urls(source, cfg, template, column, timeout, prefix=None):
         else:
             url = prefix + quote(item, safe='')
         parsed = urlparse(url)
-        if parsed.scheme not in ('http', 'https') or not parsed.netloc:
-            errors.append(f'row {line}: expected an HTTP(S) URL; configure url_prefix or use --url-template for modelIDs')
+        if parsed.scheme != 'https' or not parsed.netloc:
+            errors.append(f'row {line}: expected an HTTPS URL; configure url_prefix or use --url-template for modelIDs')
             continue
         try:
-            request = Request(url, headers={'Accept': 'application/json', 'User-Agent': 'json-versioner/1.0'})
-            with urlopen(request, timeout=timeout) as response:
-                if response.headers.get('Content-Length') and int(response.headers['Content-Length']) > 20_000_000:
-                    raise ValueError('response exceeds 20 MB')
-                payload = response.read(20_000_001)
-            if len(payload) > 20_000_000:
-                raise ValueError('response exceeds 20 MB')
+            with session.get(url, timeout=(min(timeout, 10), timeout), stream=True) as response:
+                response.raise_for_status()
+                payload = bytearray()
+                for chunk in response.iter_content(chunk_size=65536):
+                    payload.extend(chunk)
+                    if len(payload) > 20_000_000:
+                        raise ValueError('response exceeds 20 MB (after decompression)')
             raw = json.loads(payload.decode('utf-8-sig'))
             if not isinstance(raw, dict):
                 raise ValueError('expected one JSON object per URL')
@@ -320,7 +353,7 @@ def scan_urls(source, cfg, template, column, timeout, prefix=None):
                 raise ValueError(f'duplicate record ID {rid} (also {result[rid][0]})')
             value = normalize(raw, cfg)
             result[rid] = (url, value, digest(value), reported_update(raw, cfg))
-        except (HTTPError, URLError, TimeoutError, ValueError, UnicodeError, OSError) as exc:
+        except (requests.RequestException, TimeoutError, ValueError, UnicodeError, OSError) as exc:
             errors.append(f'row {line}, {url}: {exc}')
         if number % 100 == 0:
             print(f'Fetched {number}/{len(entries)} URLs', flush=True)
@@ -331,7 +364,7 @@ def schema_paths(pending, comparable_count, cfg):
     # Only additions/removals of null or empty values affecting nearly every
     # comparable record qualify. Data-bearing bulk updates remain data changes.
     occurrences = collections.Counter()
-    for _, diffs in pending.items():
+    for diffs in pending:
         for path, old, new in diffs:
             if (old is MISSING and new in (None, '', [], {})) or (new is MISSING and old in (None, '', [], {})):
                 occurrences[path] += 1
@@ -345,6 +378,13 @@ def weight(path, cfg):
 
 
 def run(args):
+    with ExitStack() as resources:
+        current = StagedRecords()
+        resources.callback(current.close)
+        return snapshot(args, current, resources)
+
+
+def snapshot(args, current, resources):
     source = args.source.resolve()
     if not source.is_dir() and not source.is_file():
         raise ValueError(f'Not a directory or list file: {source}')
@@ -357,10 +397,10 @@ def run(args):
     if source.is_dir():
         if args.url_template:
             raise ValueError('--url-template requires a .txt, .csv, .xlsx, or .json list')
-        current, errors = scan(source, cfg)
+        current, errors = scan(source, cfg, current)
     else:
         current, errors = scan_urls(source, cfg, args.url_template, args.column, args.timeout,
-                                    getattr(args, 'url_prefix', None))
+                                    getattr(args, 'url_prefix', None), current)
     if errors:
         print('\n'.join(errors[:20]), file=sys.stderr)
         if source.is_file() or cfg['invalid_json'] == 'abort':
@@ -371,18 +411,21 @@ def run(args):
         return
     history.mkdir(parents=True, exist_ok=True)
     db = database(history / 'history.sqlite3')
-    previous_row = db.execute('SELECT id,created_at FROM snapshots ORDER BY id DESC LIMIT 1').fetchone()
+    resources.callback(db.close)
+    # Serialize writers before choosing the predecessor, so snapshots cannot fork.
+    db.execute('BEGIN IMMEDIATE')
+    previous_row = db.execute('SELECT id,created_at,config_json FROM snapshots ORDER BY id DESC LIMIT 1').fetchone()
     previous_id = previous_row[0] if previous_row else None
     previous_time = parse_update(previous_row[1]) if previous_row else None
-    previous = {}
-    if previous_id:
-        for rid, filename, hash_, value in db.execute('SELECT record_id,filename,hash,json_text FROM records WHERE snapshot_id=?', (previous_id,)):
-            previous[rid] = (filename, json.loads(value), hash_)
-    pending = {}
+    if previous_row:
+        comparison_keys = ('id_fields', 'ignore_fields', 'ignore_paths', 'updated_at_fields', 'unordered_arrays', 'array_keys')
+        old_cfg = json.loads(previous_row[2])
+        if any(old_cfg.get(k) != cfg.get(k) for k in comparison_keys):
+            raise ValueError('Comparison settings changed; use a new --history directory for a new baseline')
+    previous = PreviousRecords(db, previous_id)
     common = current.keys() & previous.keys()
-    for rid in common:
-        if current[rid][2] != previous[rid][2]:
-            pending[rid] = list(changes(previous[rid][1], current[rid][1], cfg))
+    pending = (changes(previous[rid][1], current[rid][1], cfg) for rid in common
+               if current.hashes[rid] != previous.metadata[rid][1])
     schema = schema_paths(pending, len(common), cfg)
     counts = collections.Counter()
     now = dt.datetime.now(dt.timezone.utc)
@@ -391,16 +434,21 @@ def run(args):
         cur = db.execute('INSERT INTO snapshots(created_at,previous_id,source,note,config_json) VALUES(?,?,?,?,?)',
                          (timestamp, previous_id, str(source), args.note, canonical(cfg)))
         sid = cur.lastrowid
-        db.executemany('INSERT INTO records VALUES(?,?,?,?,?)',
-                       ((sid, rid, file, hash_, canonical(value)) for rid, (file, value, hash_, _) in current.items()))
+        for rid, hash_ in current.hashes.items():
+            if not db.execute('SELECT 1 FROM record_blobs WHERE hash=?', (hash_,)).fetchone():
+                put_blob(db, hash_, canonical(current[rid][1]), cfg)
+            db.execute('INSERT INTO records VALUES(?,?,?,?,NULL)', (sid, rid, current.filenames[rid], hash_))
         for rid in sorted(current.keys() | previous.keys()):
+            if rid in current and rid in previous.metadata and previous.metadata[rid] == (current.filenames[rid], current.hashes[rid]):
+                counts['unchanged'] += 1
+                continue
             old, new = previous.get(rid), current.get(rid)
             if old is None:
                 kind, diff = 'added', []
             elif new is None:
                 kind, diff = 'removed', []
             else:
-                diff = pending.get(rid, [])
+                diff = list(changes(old[1], new[1], cfg)) if old[2] != new[2] else []
                 kind = 'modified' if any(path not in schema for path, _, _ in diff) else 'unchanged'
                 if diff and kind == 'unchanged':
                     counts['schema_only'] += 1
@@ -409,7 +457,8 @@ def run(args):
                 continue
             meaningful = [(p, a, b) for p, a, b in diff if p not in schema]
             total = max(count_fields(old[1]) if old else 0, count_fields(new[1]) if new else 0, 1)
-            weighted_total = max(sum(weight(p, cfg) for p, _ in leaves(new[1] if new else old[1])), 1)
+            weighted_total = max(sum(weight(p, cfg) for p, _ in leaves(old[1])) if old else 0,
+                                 sum(weight(p, cfg) for p, _ in leaves(new[1])) if new else 0, 1)
             score = sum(weight(p, cfg) for p, _, _ in meaningful)
             reported = new[3] if new and kind == 'modified' else None
             event_at, event_basis = change_time(kind, reported, previous_time, now)
@@ -429,7 +478,6 @@ def run(args):
                    (len(current), counts['added'], counts['removed'], counts['modified'], counts['unchanged'], counts['schema_only'], sid))
     print(f'Snapshot {sid}: {len(current)} records; {counts["added"]} added, {counts["removed"]} removed, '
           f'{counts["modified"]} modified, {counts["unchanged"]} unchanged, {counts["schema_only"]} schema-only')
-    db.close()
 
 
 def main():
@@ -442,13 +490,24 @@ def main():
     parser.add_argument('--url-template', help='For ID lists, e.g. https://host/api/models/{modelID}')
     parser.add_argument('--url-prefix', help='Override config url_prefix for modelID entries')
     parser.add_argument('--column', help='CSV/Excel column or JSON object key; auto-detected by default')
-    parser.add_argument('--timeout', type=float, default=20, help='Seconds allowed per URL (default: 20)')
+    parser.add_argument('--timeout', type=float, default=20, help='Read inactivity timeout in seconds (default: 20); connect timeout capped at 10')
     parser.add_argument('--list', action='store_true', help='Show snapshot history')
+    parser.add_argument('--compact-storage', action='store_true', help='Back up, compress/deduplicate legacy records, and reclaim free space')
     args = parser.parse_args()
     try:
         if args.timeout <= 0:
             raise ValueError('--timeout must be positive')
-        if args.list:
+        if args.compact_storage:
+            path = args.history / 'history.sqlite3'
+            if not path.is_file():
+                raise ValueError(f'No database at {path}')
+            db = database(path)
+            try:
+                backup = compact_storage(db, path)
+                print(f'Compacted {path}; original backup: {backup}')
+            finally:
+                db.close()
+        elif args.list:
             db = database(args.history / 'history.sqlite3') if args.history.exists() else None
             for row in db.execute('SELECT id,created_at,total,added,removed,modified,schema_only,note FROM snapshots ORDER BY id') if db else []:
                 print(*row, sep=' | ')

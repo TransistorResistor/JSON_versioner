@@ -2,6 +2,8 @@
   "id_fields": ["modelID", "id", "record_id"],
   "group_fields": ["systemGroup"],
   "type_fields": ["systemType"],
+  "owner_fields": ["modelOwner"],
+  "name_fields": ["nomenclature", "name"],
   "url_prefix": "",
   "updated_at_fields": ["updated_at", "updatedDate"],
   "ignore_fields": ["export_timestamp", "_comment"],

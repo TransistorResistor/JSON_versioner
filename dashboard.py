@@ -1,271 +1,412 @@
-"""Explore JSON snapshot changes. Run with: python -m streamlit run dashboard.py"""
+"""Category-first JSON history dashboard: python -m streamlit run dashboard.py."""
 from __future__ import annotations
 
-import csv
-import io
+import hashlib
+import inspect
 import json
-import re
+import math
 import sqlite3
-from collections import Counter, defaultdict
 from pathlib import Path
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
+import dashboard_data as data
+
 ROOT = Path(__file__).resolve().parent
-UNKNOWN = '(Unspecified)'
-st.set_page_config(page_title='JSON change history', layout='wide')
-st.title('JSON change history')
+VIEWS = ['Category trends', 'Timing & scope', 'Change explorer', 'Storage & health']
+FILTER_KEYS = {'system_group': 'filter_groups', 'system_type': 'filter_types', 'model_owner': 'filter_owners'}
+st.set_page_config(page_title='Database change observatory', page_icon='◷', layout='wide')
 
 
-def table(rows: list[dict], key: str) -> None:
-    st.dataframe(rows, use_container_width=True, hide_index=True)
-    if rows:
-        stream = io.StringIO()
-        columns = list(dict.fromkeys(column for row in rows for column in row))
-        writer = csv.DictWriter(stream, fieldnames=columns)
-        writer.writeheader()
-        writer.writerows(rows)
-        st.download_button('Download CSV', stream.getvalue().encode('utf-8-sig'),
-                           f'{key}.csv', 'text/csv', key=key)
+def fingerprint(value):
+    return hashlib.sha256(str(value).encode()).hexdigest()[:12]
 
 
-def value_expr(json_column: str, fields: list[str]) -> str:
-    """Read the first populated top-level classification field from JSON."""
-    expressions = []
-    for field in fields:
-        if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', field):
-            raise ValueError(f'Classification field must be a simple top-level name: {field!r}')
-        expressions.append(f"NULLIF(CAST(json_extract({json_column}, '$.{field}') AS TEXT), '')")
-    return f"COALESCE({', '.join(expressions + [repr(UNKNOWN)])})"
+def select_value(label, values, format_func, index=0, key=None):
+    """Keep labels as widget values, including on older Streamlit runtimes."""
+    values = list(values)
+    labels = [format_func(value) for value in values]
+    chosen = st.selectbox(label, labels, index=index, key=key)
+    return values[labels.index(chosen)]
 
 
-def category(ratio: float, tiny: float, small: float, medium: float) -> str:
-    return 'Tiny' if ratio <= tiny else 'Small' if ratio <= small else 'Medium' if ratio <= medium else 'Large'
+def database_stamp(path):
+    result = []
+    for item in (path, Path(str(path)+'-wal')):
+        stat = item.stat() if item.exists() else None
+        result.append((stat.st_mtime_ns, stat.st_size) if stat else None)
+    return tuple(result)
 
 
-db_path = Path(st.sidebar.text_input('History database', str(ROOT / 'json_history' / 'history.sqlite3')))
-if not db_path.is_file():
-    st.info('Create a snapshot first with: python version_json.py "C:\\path\\to\\records"')
-    st.stop()
+@st.cache_data(show_spinner=False, max_entries=4)
+def load_period(path, stamp, cfg_json, start, end):
+    return data.period_data(path, json.loads(cfg_json), start, end)
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def load_fields(path, stamp, cfg_json, event_keys):
+    return data.field_scope(path, json.loads(cfg_json), event_keys)
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def load_records(path, stamp, cfg_json, snapshot_id, filters_json, search, page):
+    return data.record_page(path, json.loads(cfg_json), snapshot_id, json.loads(filters_json), search, page)
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def load_comparison(path, stamp, record_id, before_id, after_id):
+    return data.comparison(path, record_id, before_id, after_id)
+
+
+def table(rows, name, limit=500):
+    if not rows:
+        st.info('No matching data for this selection.')
+        return
+    frame = pd.DataFrame(rows)
+    st.dataframe(frame.head(limit), use_container_width=True, hide_index=True)
+    if len(frame) > limit:
+        st.caption(f'Showing {limit:,} of {len(frame):,} rows. The CSV contains all rows in this filtered result.')
+    st.download_button('Download CSV', frame.to_csv(index=False).encode('utf-8-sig'),
+                       f'{name}.csv', 'text/csv', key='csv_'+name)
+
+
+def chart(rows, mark, x, y, color=None, tooltip=None, height=300):
+    if not rows:
+        st.info('No changes in this selection.')
+        return
+    plot = alt.Chart(alt.Data(values=rows))
+    plot = plot.mark_line(point=True) if mark == 'line' else plot.mark_rect() if mark == 'heatmap' else plot.mark_bar()
+    encodings = {'x': x, 'y': y, 'tooltip': tooltip or []}
+    if color is not None:
+        encodings['color'] = color
+    st.altair_chart(plot.encode(**encodings).properties(height=height), use_container_width=True)
+
+
+def select_filters(totals, events):
+    rows = totals + events
+    filters = {}
+    for column, label in [('system_group', 'System groups'), ('system_type', 'System types'), ('model_owner', 'Model owners')]:
+        options = sorted({r[column] for r in rows if all(r[k] in values for k, values in filters.items())})
+        key = FILTER_KEYS[column]
+        if key not in st.session_state and 'saved_'+key in st.session_state:
+            st.session_state[key] = st.session_state['saved_'+key]
+        if key in st.session_state:
+            st.session_state[key] = [x for x in st.session_state[key] if x in options]
+        filters[column] = st.sidebar.multiselect(label, options, default=options, key=key)
+        st.session_state['saved_'+key] = filters[column]
+    return filters
+
+
+def reset_filters():
+    for key in FILTER_KEYS.values():
+        st.session_state.pop(key, None)
+        st.session_state.pop('saved_'+key, None)
+    st.session_state.pop('event_search', None)
+
+
+def drill_category(dimension, category):
+    st.session_state[FILTER_KEYS[dimension]] = [category]
+    st.session_state['view'] = 'Change explorer'
+
+
+def trends(totals, events, period, include_baseline):
+    st.header('Scale and concentration of change')
+    controls = st.columns([1, 1, 1])
+    dimension_label = controls[0].selectbox('Compare categories by', list(data.DIMENSIONS))
+    dimension = data.DIMENSIONS[dimension_label]
+    measure_label = controls[1].selectbox('Measure', ['Affected records (%)', 'Change events', 'Population'])
+    measure = {'Affected records (%)': 'affected_percent', 'Change events': 'events', 'Population': 'population'}[measure_label]
+    top_n = controls[2].selectbox('Categories shown', [10, 20, 50], index=0)
+    series = data.category_series(totals, events, period, dimension, include_baseline)
+    summary = data.category_summary(series, events, dimension, include_baseline)
+    if not summary:
+        st.info('No categories match these filters. Reset the filters to broaden the selection.')
+        return
+    rank_key = {'population': 'population_end', 'events': 'events', 'affected_percent': 'peak_affected_percent'}[measure]
+    ranked = sorted(summary, key=lambda r: (-(r[rank_key] or 0), r['category']))
+    categories = [r['category'] for r in ranked[:top_n]]
+    shown = [r for r in series if r['category'] in categories]
+    labels = {r['id']: f"#{r['id']} · {r['created_at'][:16].replace('T', ' ')}" for r in period}
+    for row in shown:
+        row['observation'] = labels[row['snapshot_id']]
+    st.subheader('Category × observation')
+    ranking = {'population': 'end population', 'events': 'event count', 'affected_percent': 'peak affected percentage'}[measure]
+    st.caption(f'Categories are ranked by {ranking}. Every observation is compared with its own predecessor, including the first observation in the selected range.')
+    chart(shown, 'heatmap', alt.X('observation:N', sort=list(labels.values()), title='Observation (UTC)', axis=alt.Axis(labelAngle=-40)),
+          alt.Y('category:N', sort=categories, scale=alt.Scale(domain=categories), title=dimension_label),
+          alt.Color(f'{measure}:Q', title=measure_label, scale=alt.Scale(scheme='blues', domain=[0, 100]) if measure == 'affected_percent' else alt.Scale(scheme='blues', zero=True)),
+          ['category:N', 'observation:N', 'population:Q', 'added:Q', 'removed:Q', 'modified:Q',
+           alt.Tooltip('affected_percent:Q', format='.1f'), 'baseline_excluded:N'], height=max(280, min(900, len(categories)*36+100)))
+    st.caption('Affected % = (added + removed + modified) / (current population + removed). Blank rates mean no denominator or an excluded initial baseline. Rates describe each observation, not an additive period total.')
+    focus = st.multiselect('Trend lines', categories, default=categories[:5])
+    line_rows = [r for r in shown if r['category'] in focus]
+    chart(line_rows, 'line', alt.X('observation:N', sort=list(labels.values()), title='Observation sequence (UTC)', axis=alt.Axis(labelAngle=-40)),
+          alt.Y(f'{measure}:Q', title=measure_label), alt.Color('category:N', title=dimension_label),
+          ['category:N', 'snapshot_id:O', 'observed_at:T', alt.Tooltip(f'{measure}:Q', format='.1f')])
+    st.subheader('Category scope')
+    st.caption('Unique records count each ID once per category during the period; events count repeated changes. Population delta compares the first and last selected observations and includes category/owner transfers.')
+    table(summary, 'category_scope')
+    category = st.selectbox('Inspect category', [r['category'] for r in summary])
+    st.button('Explore changes in this category', on_click=drill_category, args=(dimension, category))
+    st.subheader('System types by model owner')
+    active = data.meaningful(events, include_baseline)
+    owners = {}
+    for r in active:
+        key = r['system_type'], r['model_owner']
+        item = owners.setdefault(key, {'system_type': key[0], 'model_owner': key[1], 'events': 0, 'ids': set()})
+        item['events'] += 1
+        item['ids'].add(r['record_id'])
+    owner_rows = sorted([{'system_type': r['system_type'], 'model_owner': r['model_owner'], 'events': r['events'],
+                          'unique_records': len(r['ids'])} for r in owners.values()], key=lambda r: -r['events'])
+    table(owner_rows, 'type_owner_scope')
+
+
+def timing_scope(path, stamp, cfg_json, events, include_baseline):
+    st.header('Timing and scope')
+    a, b = st.columns(2)
+    clock = a.radio('Time basis', ['Observed', 'Estimated'], horizontal=True)
+    bucket = b.selectbox('Group timing by', ['Day', 'Week', 'Month'])
+    rows = data.timing(events, clock, bucket, include_baseline)
+    chart(rows, 'bar', alt.X('period:T', title=f'{bucket} starting (UTC)'), alt.Y('events:Q', title='Change events'),
+          alt.Color('basis:N', title='Timing basis'), ['period:T', 'basis:N', 'events:Q'])
+    st.caption('Estimated time uses a valid record timestamp for modifications; other events use the observation time. The series are mutually exclusive. Estimated dates can precede the selected observation range. Weeks start Monday.')
+    with st.expander('Timing data'):
+        table(rows, 'timing')
+    active = data.meaningful(events, include_baseline)
+    counts = [{'change': kind.title(), 'events': sum(r['kind'] == kind for r in active)} for kind in data.MEANINGFUL]
+    st.subheader('Composition of change')
+    chart(counts, 'bar', alt.X('events:Q', title='Change events'), alt.Y('change:N', title=None), height=160)
+    st.subheader('Fields driving the changes')
+    keys = tuple((r['snapshot_id'], r['record_id']) for r in active)
+    with st.spinner('Aggregating changed fields…'):
+        fields = load_fields(path, stamp, cfg_json, keys)
+    st.caption('Unique records and record events are counted separately. Array element paths are grouped under []. A record can affect several fields, so field totals overlap. Added/removed records have no leaf-level change log.')
+    chart(fields[:20], 'bar', alt.X('unique_records:Q', title='Unique records'),
+          alt.Y('field:N', sort='-x', title='Field (top 20)'),
+          tooltip=['field:N', 'unique_records:Q', 'record_events:Q', 'field_edits:Q', 'word_edits:Q'], height=max(180, min(600, len(fields)*25)))
+    table(fields, 'field_scope')
+    st.subheader('Category and owner transfers')
+    transfers = []
+    for row in active:
+        if row['kind'] != 'modified':
+            continue
+        for field in data.DIMENSIONS.values():
+            old, new = row.get('previous_'+field), row[field]
+            if old is not None and old != new:
+                transfers.append({'snapshot': row['snapshot_id'], 'record_id': row['record_id'], 'name': row['record_name'],
+                    'dimension': field, 'from': old, 'to': new, 'observed_at': row['created_at']})
+    table(transfers, 'transfers')
+    st.caption('Modification events are attributed to the new category/owner; removals use the previous values. Transfers explain population changes that are not additions or removals. Filters use the event attribution above.')
+
+
+def record_detail(path, stamp, cfg, snapshots, record_id, default_before=None, default_after=None):
+    st.subheader(f'Record · {record_id}')
+    timeline = data.record_timeline(path, cfg, record_id)
+    with st.expander('Observation history, including unchanged versions'):
+        table(timeline, 'record_timeline')
+    by_id = {r['id']: r for r in snapshots}
+    ids = list(by_id)
+    options = [None]+ids
+    label = lambda sid: '(Absent baseline)' if sid is None else f"#{sid} · {by_id[sid]['created_at'][:19]} · {by_id[sid]['note'] or 'untitled'}"
+    before_col, after_col = st.columns(2)
+    with before_col:
+        before_id = select_value('Before snapshot', options, label, index=options.index(default_before) if default_before in options else 0,
+                                 key=f'before_{record_id}_{default_before}_{default_after}')
+    with after_col:
+        after_id = select_value('After snapshot', ids, label, index=ids.index(default_after) if default_after in ids else len(ids)-1,
+                                key=f'after_{record_id}_{default_before}_{default_after}')
+    if before_id is not None and before_id > after_id:
+        st.info('Choose a Before snapshot no later than the After snapshot.')
+        return
+    before, after, diffs, compatible = load_comparison(path, stamp, record_id, before_id, after_id)
+    if not compatible:
+        st.warning('These snapshots used different comparison settings. Differences may reflect changed rules, not source changes.')
+    st.caption('Direct comparison of the stored endpoint versions. Intermediate edits that were reverted are absent here. This view includes schema/empty-value differences and does not recalculate historical scores.')
+    downloads = st.columns(2)
+    for col, value, name, sid in [(downloads[0], before, 'Before', before_id), (downloads[1], after, 'After', after_id)]:
+        if value is not data.ABSENT:
+            col.download_button(f'Download {name} JSON', json.dumps(value, ensure_ascii=False, indent=2),
+                                f'record_{fingerprint(record_id)}_{sid}.json', 'application/json', key='download_'+name)
+        else:
+            col.info(f'{name}: record absent.')
+    if not diffs:
+        st.success('No differences between these stored versions.')
+    else:
+        st.write(f'{len(diffs):,} changed fields')
+        table(diffs, 'endpoint_differences')
+        selected = select_value('Inspect changed field', range(len(diffs)), lambda i: diffs[i]['field'])
+        row = diffs[selected]
+        left, right = st.columns(2)
+        left.markdown('**Before**')
+        right.markdown('**After**')
+        if max(len(row['before']), len(row['after'])) <= 20_000:
+            old, new = data.word_diff(row['before'], row['after'])
+            left.markdown('<div style="white-space:pre-wrap;overflow-wrap:anywhere">'+old+'</div>', unsafe_allow_html=True)
+            right.markdown('<div style="white-space:pre-wrap;overflow-wrap:anywhere">'+new+'</div>', unsafe_allow_html=True)
+        else:
+            left.code(row['before'][:20_000], language='json')
+            right.code(row['after'][:20_000], language='json')
+            st.caption('Preview limited to 20,000 characters per value; complete values are in the CSV and JSON downloads.')
+    with st.expander('Complete stored versions'):
+        a, b = st.columns(2)
+        if before is not data.ABSENT:
+            a.json(before, expanded=False)
+        if after is not data.ABSENT:
+            b.json(after, expanded=False)
+
+
+def explorer(path, stamp, cfg, snapshots, period, events, filters, include_baseline):
+    st.header('Changes behind the category trends')
+    mode = st.radio('Explore', ['Change events', 'All records at an observation'], horizontal=True)
+    search = st.text_input('Search record ID, name or source', key='event_search').casefold()
+    cfg_json = json.dumps(cfg, sort_keys=True)
+    selected_event = None
+    if mode == 'Change events':
+        kinds = st.multiselect('Change kinds', ['added', 'removed', 'modified', 'schema only', 'source moved'], default=['added', 'removed', 'modified'])
+        minimum = st.slider('Minimum weighted change (%) for modifications', 0, 100, 0)
+        rows = [r for r in events if r['kind'] in kinds and (include_baseline or r['previous_id'] is not None)
+                and (r['kind'] != 'modified' or 100*(r['weighted_ratio'] or 0) >= minimum)
+                and search in (r['record_id']+' '+r['record_name']+' '+(r['filename'] or '')).casefold()]
+        rows.sort(key=lambda r: (-r['snapshot_id'], r['record_id']))
+        st.caption(f'{len(rows):,} events match. Event classifications and owner values reflect the record at that event.')
+        if not rows:
+            st.info('No matching events. Try another filter or browse all records.')
+            return
+        page = st.number_input('Page', min_value=1, max_value=max(1, math.ceil(len(rows)/50)), value=1,
+                               key='events_page_'+fingerprint((filters, search, kinds, minimum, period[0]['id'], period[-1]['id'], include_baseline)))
+        page_rows = rows[(page-1)*50:page*50]
+        shown = [{k: r[k] for k in ['snapshot_id', 'record_id', 'record_name', 'kind', 'system_group', 'system_type', 'model_owner',
+                                   'fields_changed', 'weighted_ratio', 'created_at']} for r in page_rows]
+        selectable = 'on_select' in inspect.signature(st.dataframe).parameters
+        if selectable:
+            selection = st.dataframe(shown, use_container_width=True, hide_index=True, on_select='rerun',
+                selection_mode='single-row', key='event_table_'+fingerprint(shown))
+            selected_rows = selection.selection.rows
+            selected_event = page_rows[selected_rows[0]] if selected_rows else None
+        else:
+            st.dataframe(shown, use_container_width=True, hide_index=True)
+        if selected_event is None:
+            index = select_value('Record event on this page', range(len(page_rows)),
+                lambda i: f"#{page_rows[i]['snapshot_id']} · {page_rows[i]['record_name']} · {page_rows[i]['record_id']} · {page_rows[i]['kind']}",
+                key='event_pick_'+fingerprint(shown))
+            selected_event = page_rows[index]
+        st.download_button('Download filtered events CSV', pd.DataFrame(rows).to_csv(index=False).encode('utf-8-sig'),
+                           'filtered_events.csv', 'text/csv')
+        rid, previous_id, sid = selected_event['record_id'], selected_event['previous_id'], selected_event['snapshot_id']
+    else:
+        by_id = {r['id']: r for r in period}
+        sid = select_value('Observation', list(by_id),
+                           lambda i: f"#{i} · {by_id[i]['created_at'][:19]} · {by_id[i]['note'] or 'untitled'}", index=len(period)-1)
+        filter_json = json.dumps(filters, sort_keys=True)
+        total, first = load_records(path, stamp, cfg_json, sid, filter_json, search, 0)
+        st.caption(f'{total:,} records match, including unchanged records.')
+        if not total:
+            st.info('No matching records at this observation.')
+            return
+        page = st.number_input('Page', min_value=1, max_value=max(1, math.ceil(total/50)), value=1,
+                               key='records_page_'+fingerprint((filter_json, sid, search)))
+        _, page_rows = (total, first) if page == 1 else load_records(path, stamp, cfg_json, sid, filter_json, search, page-1)
+        st.dataframe([{k: r[k] for k in ['record_id', 'record_name', 'system_group', 'system_type', 'model_owner']} for r in page_rows],
+                     use_container_width=True, hide_index=True)
+        index = select_value('Record on this page', range(len(page_rows)),
+            lambda i: f"{page_rows[i]['record_name']} · {page_rows[i]['record_id']}", key='record_pick_'+fingerprint(page_rows))
+        rid, previous_id = page_rows[index]['record_id'], by_id[sid]['previous_id']
+    record_detail(path, stamp, cfg, snapshots, rid, previous_id, sid)
+
+
+def storage_health(path, snapshots):
+    st.header('Storage and observation health')
+    stats = data.storage_stats(path)
+    a, b, c = st.columns(3)
+    a.metric('Database size', f"{stats['database_bytes']/1_000_000:,.1f} MB")
+    b.metric('Compressed payloads', f"{stats.get('compressed_bytes',0)/1_000_000:,.1f} MB")
+    c.metric('Legacy record copies', f"{stats['legacy_records']:,}")
+    raw, compressed = stats.get('unique_raw_bytes', 0), stats.get('compressed_bytes', 0)
+    st.write(f"{stats.get('unique_payloads',0):,} unique payloads · {100*(1-compressed/raw) if raw else 0:.1f}% compression saving on unique JSON · {stats['free_bytes']/1_000_000:,.1f} MB reusable free space")
+    st.caption('Database size includes indexes, snapshot references, and field values. Payload savings exclude legacy rows. Existing metadata missing owner/name fields is read from stored JSON without modifying history.')
+    st.write('Latest observation (UTC):', snapshots[-1]['created_at'])
+    gaps = []
+    for previous, current in zip(snapshots, snapshots[1:]):
+        hours = (pd.Timestamp(current['created_at'])-pd.Timestamp(previous['created_at'])).total_seconds()/3600
+        gaps.append({'snapshot': current['id'], 'observed_at': current['created_at'], 'hours_since_previous': round(hours, 2)})
+    chart(gaps, 'bar', alt.X('observed_at:T', title='Observation (UTC)'), alt.Y('hours_since_previous:Q', title='Hours since previous observation'))
+    st.caption('Gaps show collection cadence, not confirmed outages. Failed collection attempts and historical file-size samples are not stored, so this page does not infer them.')
+    table([{k: r[k] for k in ['id', 'created_at', 'note', 'total', 'added', 'removed', 'modified', 'schema_only']} for r in snapshots], 'observations')
+    with st.expander('Legacy storage maintenance'):
+        st.code('python version_json.py --compact-storage', language='powershell')
+        st.write('Run from the terminal with writers stopped and this dashboard closed. The command creates a backup before conversion and compaction.')
+
+
+def main():
+    st.title('Database change observatory')
+    st.caption('Understand the scale, scope and timing of changes across system types, groups and model owners.')
+    path = Path(st.sidebar.text_input('History database', str(ROOT / 'json_history' / 'history.sqlite3'))).resolve()
+    if not path.is_file():
+        st.info('Create a snapshot first with version_json.py, or select an existing history database.')
+        return
+    if st.sidebar.button('Refresh data'):
+        st.cache_data.clear()
+    snapshots = data.snapshots(path)
+    if not snapshots:
+        st.info('No observations yet.')
+        return
+    signature = str(path)
+    if st.session_state.get('active_database') != signature:
+        reset_filters()
+        st.session_state['active_database'] = signature
+    st.sidebar.radio('View', VIEWS, key='view')
+    if st.session_state['view'] == 'Storage & health':
+        storage_health(str(path), snapshots)
+        return
+    by_id = {r['id']: r for r in snapshots}
+    ids = list(by_id)
+    st.sidebar.subheader('Observation range')
+    labels = {f"#{i} · {by_id[i]['created_at'][:10]}": i for i in ids}
+    options = list(labels)
+    first, last = st.sidebar.select_slider('From / through snapshot', options=options,
+                                          value=(options[max(0, len(options)-30)], options[-1]))
+    start, end = labels[first], labels[last]
+    period = [r for r in snapshots if start <= r['id'] <= end]
+    st.sidebar.caption(f"{by_id[start]['created_at']} → {by_id[end]['created_at']} (UTC)")
+    st.sidebar.caption(f"From: {by_id[start]['note'] or 'untitled'} · Through: {by_id[end]['note'] or 'untitled'}")
+    include_baseline = st.sidebar.checkbox('Include initial baseline as additions', value=False)
+    cfg = json.loads(by_id[end]['config_json'])
+    local = ROOT / 'config.json'
+    if local.exists():
+        display = json.loads(local.read_text(encoding='utf-8'))
+        for key in ('group_fields', 'type_fields', 'owner_fields', 'name_fields'):
+            if key in display:
+                cfg[key] = display[key]
+    cfg_json = json.dumps(cfg, sort_keys=True)
+    stamp = database_stamp(path)
+    with st.spinner('Loading category history…'):
+        totals, events = load_period(str(path), stamp, cfg_json, start, end)
+    st.sidebar.subheader('Categories')
+    filters = select_filters(totals, events)
+    st.sidebar.button('Reset filters', on_click=reset_filters)
+    totals, events = data.scoped(totals, filters), data.scoped(events, filters)
+    active = data.meaningful(events, include_baseline)
+    population = sum(r['population'] for r in totals if r['snapshot_id'] == end)
+    a, b, c, d = st.columns(4)
+    a.metric('Population at end', f'{population:,}')
+    b.metric('Unique records affected', f"{len({r['record_id'] for r in active}):,}")
+    c.metric('Change events', f'{len(active):,}')
+    d.metric('System types affected', f"{len({r['system_type'] for r in active}):,}")
+    st.caption(f"{len(period)} observations · population at #{end} · events compared with each observation's predecessor · {'initial baseline included' if include_baseline else 'initial baseline excluded'}")
+    with st.expander('How to read these measures'):
+        st.write('A change event is one added, removed, or meaningfully modified record at one observation. Repeated changes count as multiple events; unique records count each ID once across the selected period. Schema-only and source-move events are available in the explorer but excluded from these impact metrics.')
+        st.write('Group, type, and owner are read from the version at the event; removals use the previous version. Owner/category moves are attributed to the destination. Missing values are shown as (Unspecified). Population is the number of records present at an observation.')
+    if st.session_state['view'] == 'Category trends':
+        trends(totals, events, period, include_baseline)
+    elif st.session_state['view'] == 'Timing & scope':
+        timing_scope(str(path), stamp, cfg_json, events, include_baseline)
+    else:
+        explorer(str(path), stamp, cfg, snapshots, period, events, filters, include_baseline)
+
+
 try:
-    db = sqlite3.connect(f'file:{db_path.resolve().as_posix()}?mode=ro', uri=True)
-    db.row_factory = sqlite3.Row
-    snapshots = [dict(r) for r in db.execute('SELECT * FROM snapshots ORDER BY id')]
-except sqlite3.Error as exc:
-    st.error(f'Cannot read history: {exc}')
-    st.stop()
-if not snapshots:
-    st.info('No snapshots yet.')
-    st.stop()
-
-snapshot_by_id = {s['id']: s for s in snapshots}
-ids = list(snapshot_by_id)
-st.sidebar.subheader('Time period')
-start_id, end_id = st.sidebar.select_slider(
-    'From / through snapshot', options=ids, value=(ids[0], ids[-1]))
-st.sidebar.caption(f"{snapshot_by_id[start_id]['created_at']} through {snapshot_by_id[end_id]['created_at']}")
-period = [s for s in snapshots if start_id <= s['id'] <= end_id]
-sid = st.sidebar.selectbox('Inspect snapshot', [s['id'] for s in period], index=len(period)-1)
-selected = snapshot_by_id[sid]
-st.sidebar.caption(f"{selected['created_at']} | {selected['note'] or 'untitled'}")
-cfg = json.loads(selected['config_json'])
-local_config = ROOT / 'config.json'
-if local_config.exists():
-    cfg.update(json.loads(local_config.read_text(encoding='utf-8')))
-try:
-    group_expr = value_expr('r.json_text', cfg.get('group_fields', ['systemGroup']))
-    family_expr = value_expr('r.json_text', cfg.get('type_fields', ['systemType']))
-    group_change_expr = value_expr('COALESCE(r.json_text, old.json_text)', cfg.get('group_fields', ['systemGroup']))
-    family_change_expr = value_expr('COALESCE(r.json_text, old.json_text)', cfg.get('type_fields', ['systemType']))
-except ValueError as exc:
-    st.error(str(exc))
-    st.stop()
-
-# Aggregate classification from the stored JSON. This also works with history
-# created before group/family filters were added, without a database migration.
-try:
-    grouped_totals = [dict(r) for r in db.execute(f'''
-        SELECT r.snapshot_id, {group_expr} AS system_group, {family_expr} AS family,
-               COUNT(*) AS total
-        FROM records r WHERE r.snapshot_id BETWEEN ? AND ?
-        GROUP BY r.snapshot_id, system_group, family''', (start_id, end_id))]
-    change_rows = [dict(r) for r in db.execute(f'''
-        SELECT rc.*, s.created_at, s.previous_id,
-               {group_change_expr} AS system_group, {family_change_expr} AS family,
-               EXISTS(SELECT 1 FROM field_changes f WHERE f.snapshot_id=rc.snapshot_id
-                   AND f.record_id=rc.record_id AND f.schema_only=1) AS has_schema_change
-        FROM record_changes rc JOIN snapshots s ON s.id=rc.snapshot_id
-        LEFT JOIN records r ON r.snapshot_id=rc.snapshot_id AND r.record_id=rc.record_id
-        LEFT JOIN records old ON old.snapshot_id=s.previous_id AND old.record_id=rc.record_id
-        WHERE rc.snapshot_id BETWEEN ? AND ?''', (start_id, end_id))]
-except sqlite3.Error as exc:
-    st.error(f'Cannot read classifications: {exc}')
-    st.stop()
-
-groups = sorted({r['system_group'] for r in grouped_totals} | {r['system_group'] for r in change_rows})
-chosen_groups = st.sidebar.multiselect('System groups', groups, default=groups)
-families = sorted({r['family'] for r in grouped_totals + change_rows if r['system_group'] in chosen_groups})
-chosen_families = st.sidebar.multiselect('System types', families, default=families)
-
-
-def in_scope(row: dict) -> bool:
-    return row['system_group'] in chosen_groups and row['family'] in chosen_families
-
-
-totals = [r for r in grouped_totals if in_scope(r)]
-changes = [r for r in change_rows if in_scope(r)]
-selected_changes = [r for r in changes if r['snapshot_id'] == sid]
-selected_total = sum(r['total'] for r in totals if r['snapshot_id'] == sid)
-selected_counts = Counter(r['change_type'] for r in selected_changes)
-selected_schema = sum(r['change_type'] == 'unchanged' and r['has_schema_change'] for r in selected_changes)
-selected_unchanged = selected_total - selected_counts['added'] - selected_counts['modified']
-affected = selected_counts['added'] + selected_counts['removed'] + selected_counts['modified']
-denominator = max(selected_total + selected_counts['removed'], 1)
-
-st.subheader('Snapshot summary')
-st.caption(f"Snapshot {sid} | {selected['created_at']} | {', '.join(chosen_groups) if chosen_groups else 'No groups selected'}")
-metrics = [('Total', selected_total), ('Added', selected_counts['added']),
-           ('Removed', selected_counts['removed']), ('Modified', selected_counts['modified']),
-           ('Unchanged', selected_unchanged), ('Affected', f'{affected/denominator:.1%}'),
-           ('Schema only', selected_schema)]
-for col, (label, value) in zip(st.columns(7), metrics):
-    col.metric(label, value)
-
-st.subheader('Breakdown by system group and system type')
-breakdown = []
-for entry in [r for r in totals if r['snapshot_id'] == sid]:
-    subset = [r for r in selected_changes if r['system_group'] == entry['system_group'] and r['family'] == entry['family']]
-    counts = Counter(r['change_type'] for r in subset)
-    breakdown.append({'system_group': entry['system_group'], 'system_type': entry['family'],
-                      'total': entry['total'], 'added': counts['added'], 'removed': counts['removed'],
-                      'modified': counts['modified'],
-                      'unchanged': entry['total'] - counts['added'] - counts['modified']})
-# Removed-only groups are absent from the current snapshot but still matter.
-for group, family in sorted({(r['system_group'], r['family']) for r in selected_changes if r['change_type'] == 'removed'}):
-    if not any(r['system_group'] == group and r['system_type'] == family for r in breakdown):
-        breakdown.append({'system_group': group, 'system_type': family, 'total': 0, 'added': 0,
-                          'removed': sum(r['change_type'] == 'removed' and r['system_group'] == group and r['family'] == family
-                                         for r in selected_changes), 'modified': 0, 'unchanged': 0})
-table(breakdown, 'group_family_breakdown')
-
-thresholds = cfg.get('change_thresholds', {'tiny': .02, 'small': .10, 'medium': .40})
-st.sidebar.subheader('Change ratio boundaries')
-tiny = st.sidebar.number_input('Tiny up to', 0.0, 1.0, float(thresholds['tiny']), step=.01)
-small = st.sidebar.number_input('Small up to', 0.0, 1.0, float(thresholds['small']), step=.01)
-medium = st.sidebar.number_input('Medium up to', 0.0, 1.0, float(thresholds['medium']), step=.01)
-if not tiny <= small <= medium:
-    st.sidebar.error('Boundaries must increase.')
-    st.stop()
-
-modified = [r for r in selected_changes if r['change_type'] == 'modified']
-for row in modified:
-    row['magnitude'] = category(row['weighted_ratio'], tiny, small, medium)
-st.subheader('Change magnitude')
-st.bar_chart(pd.Series({name: sum(r['magnitude'] == name for r in modified)
-                        for name in ('Tiny', 'Small', 'Medium', 'Large')}, name='records'))
-
-st.subheader('Historical trends')
-trend_rows = []
-for snapshot in period:
-    snapshot_id = snapshot['id']
-    total = sum(r['total'] for r in totals if r['snapshot_id'] == snapshot_id)
-    rows = [r for r in changes if r['snapshot_id'] == snapshot_id]
-    counts = Counter(r['change_type'] for r in rows)
-    impacted = counts['added'] + counts['removed'] + counts['modified']
-    trend_rows.append({'snapshot': snapshot_id, 'time': snapshot['created_at'], 'total': total,
-                       'added': counts['added'], 'removed': counts['removed'], 'modified': counts['modified'],
-                       'schema_only': sum(r['change_type'] == 'unchanged' and r['has_schema_change'] for r in rows),
-                       'affected_percent': round(100 * impacted / max(total + counts['removed'], 1), 2)})
-table(trend_rows, 'historical_trends')
-st.line_chart(pd.DataFrame(trend_rows).set_index('snapshot')[['added', 'removed', 'modified', 'affected_percent']])
-
-st.subheader('Estimated change timing')
-st.caption('Record timestamps are used for meaningful modifications only when they fall between the two snapshot times. Other events use the observation time.')
-timed_changes = [r for r in changes if r['change_type'] in ('added', 'removed', 'modified') and r.get('event_at')]
-by_day = Counter(r['event_at'][:10] for r in timed_changes)
-timing_rows = [{'date': day, 'changes': count,
-                'from_record_timestamp': sum(r['event_at'][:10] == day and r.get('event_basis') == 'record timestamp'
-                                             for r in timed_changes)}
-               for day, count in sorted(by_day.items())]
-table(timing_rows, 'change_timing')
-if timing_rows:
-    st.bar_chart(pd.DataFrame(timing_rows).set_index('date')[['changes', 'from_record_timestamp']])
-
-st.subheader('Modified records')
-search = st.text_input('Search record ID or filename').lower()
-allowed_magnitudes = st.multiselect('Magnitude', ['Tiny', 'Small', 'Medium', 'Large'],
-                                    default=['Tiny', 'Small', 'Medium', 'Large'])
-visible = [r for r in modified if r['magnitude'] in allowed_magnitudes
-           and search in (r['record_id'] + ' ' + r['filename']).lower()]
-table([{'record_id': r['record_id'], 'filename': r['filename'], 'system_group': r['system_group'],
-        'system_type': r['family'], 'magnitude': r['magnitude'], 'weighted_ratio': r['weighted_ratio'],
-        'fields_changed': r['fields_changed'], 'fields_total': r['fields_total'],
-        'previous_snapshot': r['previous_id'], 'snapshot': r['snapshot_id'],
-        'estimated_change_at': r.get('event_at'), 'time_basis': r.get('event_basis')}
-       for r in visible], 'modified_records')
-
-st.subheader('Record detail')
-record_ids = sorted({r['record_id'] for r in changes})
-if record_ids:
-    chosen = st.selectbox('Record', record_ids)
-    history = [{'snapshot': r['snapshot_id'], 'time': r['created_at'], 'change_type': r['change_type'],
-                'filename': r['filename'], 'system_group': r['system_group'], 'system_type': r['family'],
-                'fields_changed': r['fields_changed'], 'change_ratio': r['change_ratio'],
-                'weighted_ratio': r['weighted_ratio'], 'estimated_change_at': r.get('event_at'),
-                'time_basis': r.get('event_basis'), 'reported_updated_at': r.get('reported_updated_at')}
-               for r in changes if r['record_id'] == chosen]
-    table(sorted(history, key=lambda r: -r['snapshot']), 'record_history')
-    details = [dict(r) for r in db.execute('''SELECT f.snapshot_id,s.created_at,rc.event_at AS estimated_change_at,
-        f.json_path,f.old_value,f.new_value,f.schema_only,f.word_edits
-        FROM field_changes f JOIN snapshots s ON s.id=f.snapshot_id
-        LEFT JOIN record_changes rc ON rc.snapshot_id=f.snapshot_id AND rc.record_id=f.record_id
-        WHERE f.record_id=? AND f.snapshot_id BETWEEN ? AND ?
-        ORDER BY f.snapshot_id DESC,f.json_path''', (chosen, start_id, end_id))]
-    for row in details:
-        n = row['word_edits']
-        row['description_size'] = ('Small' if n < 50 else 'Medium' if n <= 250 else 'Large') if n is not None else ''
-        row['change_kind'] = 'schema only' if row.pop('schema_only') else 'value'
-    table(details, 'record_fields')
-else:
-    st.info('No changed records in this selection.')
-
-allowed_pairs = {(r['snapshot_id'], r['record_id']) for r in changes}
-fields = [dict(r) for r in db.execute('''SELECT snapshot_id,record_id,json_path,word_edits
-    FROM field_changes WHERE snapshot_id BETWEEN ? AND ? AND schema_only=0''', (start_id, end_id))
-          if (r['snapshot_id'], r['record_id']) in allowed_pairs]
-
-st.subheader('Description changes')
-descriptions = [r for r in fields if r['snapshot_id'] == sid and r['word_edits'] is not None]
-for row in descriptions:
-    n = row['word_edits']
-    row['size'] = 'Small' if n < 50 else 'Medium' if n <= 250 else 'Large'
-    event = next((c for c in selected_changes if c['record_id'] == row['record_id']), None)
-    row['estimated_change_at'] = event.get('event_at') if event else None
-size_filter = st.multiselect('Description edit size', ['Small', 'Medium', 'Large'], default=['Medium', 'Large'])
-st.caption('Word edits count additions, removals, and replacements. Medium: 50–250; Large: over 250.')
-table(sorted((r for r in descriptions if r['size'] in size_filter), key=lambda r: -r['word_edits']),
-      'description_changes')
-
-st.subheader('Field analysis')
-field_counts = Counter(r['json_path'] for r in fields)
-field_snapshots = defaultdict(set)
-for row in fields:
-    field_snapshots[row['json_path']].add(row['snapshot_id'])
-table([{'json_path': path, 'records_changed': count, 'snapshots_changed': len(field_snapshots[path])}
-       for path, count in field_counts.most_common(500)], 'field_frequency')
-selected_field_counts = Counter(r['json_path'] for r in fields if r['snapshot_id'] == sid)
-comparable = max(selected_total - selected_counts['added'], 1)
-st.caption('Bulk fields in the inspected snapshot: changed in at least 20% of comparable records.')
-table([{'json_path': path, 'records_changed': count, 'percent_of_records': round(100*count/comparable, 1)}
-       for path, count in selected_field_counts.most_common() if count/comparable >= .2], 'bulk_fields')
-
-st.subheader('Change matrix')
-matrix_counts = Counter((r['json_path'], r['snapshot_id']) for r in fields)
-matrix = defaultdict(dict)
-for (path, snapshot_id), count in matrix_counts.items():
-    matrix[path][str(snapshot_id)] = count
-matrix_rows = [{'field': path, **counts} for path, counts in matrix.items()]
-matrix_rows.sort(key=lambda row: -sum(value for key, value in row.items() if key != 'field'))
-table(matrix_rows[:100], 'change_matrix')
-db.close()
+    main()
+except (sqlite3.Error, ValueError, OSError) as exc:
+    st.error(f'Cannot read this history: {exc}')

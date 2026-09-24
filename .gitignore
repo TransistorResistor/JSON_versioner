@@ -13,3 +13,13 @@ venv/
 .streamlit/secrets.toml
 .env
 .env.*
+mockups/qa/
+
+# Local-only tests, benchmarks, mockups, and browser QA
+test_*.py
+benchmark_*.py
+verify_dashboard_ui.py
+mockups/
+
+# Local maintenance backups
+*.pre-compression.bak
