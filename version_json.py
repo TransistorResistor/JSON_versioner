@@ -126,6 +126,25 @@ def word_edits(old, new):
     return sum(max(i2-i1, j2-j1) for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b).get_opcodes() if tag != 'equal')
 
 
+def array_key_fields(spec):
+    """Return a validated list of fields from a string or composite key spec."""
+    fields = [spec] if isinstance(spec, str) else spec
+    if not isinstance(fields, list) or not fields or not all(isinstance(field, str) and field for field in fields):
+        raise ValueError(f'array_keys values must be a field name or non-empty field-name list; got {spec!r}')
+    return fields
+
+
+def array_identity(item, fields):
+    return tuple(canonical(item[field]) for field in fields)
+
+
+def array_path(path, fields, identity):
+    # Percent encoding keeps brackets and commas in source values from making
+    # the human-readable JSON path ambiguous.
+    parts = [f'{field}={quote(value, safe="")}' for field, value in zip(fields, identity)]
+    return f'{path}[{",".join(parts)}]'
+
+
 def changes(old, new, cfg, path='$'):
     if old is not MISSING and new is not MISSING and canonical(old) == canonical(new):
         return
@@ -133,13 +152,17 @@ def changes(old, new, cfg, path='$'):
         for key in sorted(old.keys() | new.keys()):
             yield from changes(old.get(key, MISSING), new.get(key, MISSING), cfg, f'{path}.{key}')
     elif isinstance(old, list) and isinstance(new, list):
-        key = cfg.get('array_keys', {}).get(path)
-        if key and all(isinstance(x, dict) and key in x for x in old + new):
-            a = {str(x[key]): x for x in old}
-            b = {str(x[key]): x for x in new}
+        key_spec = cfg.get('array_keys', {}).get(path)
+        if key_spec:
+            keys = array_key_fields(key_spec)
+        else:
+            keys = []
+        if keys and all(isinstance(x, dict) and all(key in x for key in keys) for x in old + new):
+            a = {array_identity(x, keys): x for x in old}
+            b = {array_identity(x, keys): x for x in new}
             if len(a) == len(old) and len(b) == len(new):
                 for name in sorted(a.keys() | b.keys()):
-                    yield from changes(a.get(name, MISSING), b.get(name, MISSING), cfg, f'{path}[{key}={name}]')
+                    yield from changes(a.get(name, MISSING), b.get(name, MISSING), cfg, array_path(path, keys, name))
                 return
         for i in range(max(len(old), len(new))):
             yield from changes(old[i] if i < len(old) else MISSING,

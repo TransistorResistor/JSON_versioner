@@ -9,7 +9,23 @@
   "ignore_fields": ["export_timestamp", "_comment"],
   "ignore_paths": ["$.parametrics[].parameterDescr"],
   "unordered_arrays": ["$.tags", "$.categories"],
-  "array_keys": {"$.descriptions": "descrType", "$.parametrics": "parameter", "$.aliases": "alias", "$.codes": "code", "$.media": "mediaID"},
+  "array_keys": {
+    "$.descriptions": "descrType",
+    "$.parametrics": ["component", "parameter"],
+    "$.relations": ["childModelID", "relationType", "parentComponent"],
+    "$.proliferations": ["country", "proliferation", "organization"],
+    "$.aliases": "alias",
+    "$.codes": "code",
+    "$.media": "mediaID"
+  },
+  "content_categories": [
+    {"key": "descriptions", "label": "Descriptions", "paths": ["$.descriptions[]"]},
+    {"key": "parameters", "label": "Parameters", "paths": ["$.parametrics[]"]},
+    {"key": "relationships", "label": "Relationships", "paths": ["$.relations[]"]},
+    {"key": "media", "label": "Media", "paths": ["$.media[]"]},
+    {"key": "metadata", "label": "Metadata", "fallback": true}
+  ],
+  "description_edit_thresholds": {"small": 50, "medium": 250},
   "important_fields": {"$.status": 3, "$.owner": 2, "$.classification": 3},
   "change_thresholds": {"tiny": 0.02, "small": 0.10, "medium": 0.40},
   "schema_field_fraction": 0.9,

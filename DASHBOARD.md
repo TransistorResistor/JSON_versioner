@@ -6,7 +6,7 @@ The dashboard is organised around comparing **system types**, with system group 
 
 `mockups/category-trends.html` contains three interactive mockup states: category trends, timing/scope, and category drill-down. They use clearly labelled illustrative data, with local owner/group filtering. The design choices carry into the Streamlit implementation, which uses native controls and charts rather than copying the mockup's exact CSS.
 
-The implemented views are Category trends, Timing & scope, Change explorer, and Storage & health. Only the active view executes its detailed queries. Root-level `modelOwner` is filtered and displayed alongside system group/type. Missing owner values remain visible as `(Unspecified)`; no owners were invented or injected into existing user records.
+The implemented views are Category trends, Content changes, Timing & scope, Change explorer, and Storage & health. Only the active view executes its detailed queries. Root-level `modelOwner` is filtered and displayed alongside system group/type. Missing owner values remain visible as `(Unspecified)`; no owners were invented or injected into existing user records.
 
 ## Separation of responsibilities
 
@@ -29,6 +29,9 @@ All application connections use SQLite `mode=ro`. Temporary classification views
 7. **Timing:** UTC day, Monday-start week, or month. Observed timing uses the snapshot timestamp. Estimated timing uses a valid stored record timestamp or a mutually exclusive observation fallback. Estimated dates can lie before the first selected observation.
 8. **Field scope:** group array paths under `[]`; distinguish unique IDs, unique record/observation pairs, individual field edits, and edited-word counts. Different fields overlap, so summing their unique counts is not a dataset total. Added/removed records have no precomputed leaf diff.
 9. **Record comparison:** compute differences between selected normalised endpoint payloads, not a sum of historical field changes. Warn when comparison settings differ. Historical category totals and scores are not rewritten.
+10. **Content taxonomy:** map `descriptions`, `parametrics`, `relations`, and `media` arrays to Descriptions, Parameters, Relationships, and Media. The fallback is Metadata, which deliberately includes `proliferations`, aliases, codes, and other root fields.
+11. **Content operations:** group changed leaves by record, observation, category, and keyed-array item. Several changed fields on one item count as one modification. Whole-record additions/removals stay separate because their contents represent inventory entering/leaving the dataset rather than editing activity.
+12. **Description magnitude:** count edited words across each modified description item. Small is below 50, Medium is 50 through 250, and Large is above 250 by default. Added/removed descriptions are distinct operations; non-text description changes are Other.
 
 ## Performance boundaries
 
@@ -36,11 +39,11 @@ SQLite groups snapshot populations before returning them. Normal views operate o
 
 All-record browsing uses `LIMIT/OFFSET` and a filtered SQL count. Event browsing displays 50 headers at a time but **the selected range's event headers are still materialised and filtered in Python**. This is appropriate for sparse updates over the default 30 observations; a long range with 10,000 changes every observation can consume substantial memory. The next scaling step is persistent category summaries plus fully SQL-filtered event pagination, not silently truncating metrics. CSV exports contain the complete filtered event result; displayed aggregate tables cap previews at 500 rows.
 
-Changing owner/name settings or reading older payload metadata can trigger decompression on the first load. The cache and small per-connection metadata cache limit repeated work; no persistent metadata backfill is performed by the dashboard.
+Changing owner/name settings or reading older payload metadata can trigger decompression on the first load. The cache and small per-connection metadata cache limit repeated work; no persistent metadata backfill is performed by the dashboard. Content analysis reads field-history rows only when its view is opened and caches the classified result.
 
 ## Validation
 
-Automated tests cover baseline exclusion, population denominators, removed-only categories, repeated edits versus unique IDs, owner moves, missing owners, old metadata fallback, exclusive timing series, record pagination/name search, HTML escaping, unchanged observation histories, endpoint reversions, and navigation/filter persistence. The original snapshot/HTTPS/compaction tests remain in the suite.
+Automated tests cover baseline exclusion, population denominators, removed-only categories, repeated edits versus unique IDs, owner moves, missing owners, old metadata fallback, exclusive timing series, record pagination/name search, HTML escaping, unchanged observation histories, endpoint reversions, navigation/filter persistence, composite array identities, content item operations, Metadata fallback, and description sizing. The original snapshot/HTTPS/compaction tests remain in the suite.
 
 The synthetic `python benchmark_dashboard.py` run used 10,000 records across 30 observations (300,000 membership rows), with 1% changing per later observation. A cold read returned 180 population aggregates and 12,900 event headers, including 10,000 baseline additions, in **5.665 seconds**. Excluding the baseline produced the expected 2,900 change events. This measures aggregate-query scale with small metadata-bearing payloads; it is not a 2.5 GB payload benchmark or an older-metadata decompression benchmark. Repeated dashboard interactions reuse cached period results.
 
@@ -53,4 +56,4 @@ The heatmap uses Altair's rectangle mark with categorical axes and numeric colou
 - No write controls or automatic compaction in the dashboard.
 - No inferred failed collections, exact edit times, or storage-growth history where the source database has not recorded them.
 - Old ignored fields cannot be recovered from normalised JSON. Owner fields previously excluded from snapshots remain unspecified there.
-- Very large changed values have a 20,000-character comparison preview; full values remain in downloads. Existing ambiguous JSON path escaping is unchanged.
+- Very large changed values have a 20,000-character comparison preview; full values remain in downloads. Keyed-array identity values are percent encoded in new field paths; arbitrary object keys still use dot paths without escaping.

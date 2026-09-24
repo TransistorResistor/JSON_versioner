@@ -15,7 +15,7 @@ import streamlit as st
 import dashboard_data as data
 
 ROOT = Path(__file__).resolve().parent
-VIEWS = ['Category trends', 'Timing & scope', 'Change explorer', 'Storage & health']
+VIEWS = ['Category trends', 'Content changes', 'Timing & scope', 'Change explorer', 'Storage & health']
 FILTER_KEYS = {'system_group': 'filter_groups', 'system_type': 'filter_types', 'model_owner': 'filter_owners'}
 st.set_page_config(page_title='Database change observatory', page_icon='◷', layout='wide')
 
@@ -48,6 +48,11 @@ def load_period(path, stamp, cfg_json, start, end):
 @st.cache_data(show_spinner=False, max_entries=16)
 def load_fields(path, stamp, cfg_json, event_keys):
     return data.field_scope(path, json.loads(cfg_json), event_keys)
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def load_content_changes(path, stamp, cfg_json, events_json):
+    return data.content_change_details(path, json.loads(cfg_json), json.loads(events_json))
 
 
 @st.cache_data(show_spinner=False, max_entries=64)
@@ -161,6 +166,125 @@ def trends(totals, events, period, include_baseline):
     owner_rows = sorted([{'system_type': r['system_type'], 'model_owner': r['model_owner'], 'events': r['events'],
                           'unique_records': len(r['ids'])} for r in owners.values()], key=lambda r: -r['events'])
     table(owner_rows, 'type_owner_scope')
+
+
+def content_changes_view(path, stamp, cfg, snapshots, events, include_baseline):
+    st.header('Changes by JSON content category')
+    active = data.meaningful(events, include_baseline)
+    # Item-level history exists for modified records. Whole-record additions
+    # and removals remain separate inventory events by design.
+    modified = [row for row in active if row['kind'] == 'modified']
+    cfg_json = json.dumps(cfg, sort_keys=True)
+    events_json = json.dumps(modified, sort_keys=True)
+    with st.spinner('Classifying changed JSON fields…'):
+        details = load_content_changes(path, stamp, cfg_json, events_json)
+    summary = data.content_change_summary(details)
+    additions = sum(row['kind'] == 'added' for row in active)
+    removals = sum(row['kind'] == 'removed' for row in active)
+    record_category_events = {(row['snapshot_id'], row['record_id'], row['content_key']) for row in details}
+    description_large = sum(row['content_key'] == 'descriptions' and row['magnitude'] == 'Large' for row in details)
+    a, b, c, d = st.columns(4)
+    a.metric('Records with categorised edits', f"{len({row['record_id'] for row in details}):,}")
+    b.metric('Record-category events', f'{len(record_category_events):,}')
+    c.metric('Item / metadata changes', f'{len(details):,}')
+    d.metric('Large description edits', f'{description_large:,}')
+    st.caption(f'{additions:,} whole records added and {removals:,} removed in this selection. Their initial/final contents are excluded from item-operation totals, so record inventory changes do not swamp editing activity.')
+    if not details:
+        st.info('No field-level content changes match this selection. Added and removed whole records are shown above; schema-only changes are excluded.')
+        return
+
+    st.subheader('Content category × system type')
+    heat = {}
+    for row in details:
+        key = row['system_type'], row['content_category']
+        item = heat.setdefault(key, {'system_type': key[0], 'content_category': key[1], 'events': set(), 'records': set(), 'item_changes': 0})
+        item['events'].add((row['snapshot_id'], row['record_id']))
+        item['records'].add(row['record_id'])
+        item['item_changes'] += 1
+    heat_rows = [{'system_type': item['system_type'], 'content_category': item['content_category'],
+                  'record_events': len(item['events']), 'unique_records': len(item['records']),
+                  'item_changes': item['item_changes']} for item in heat.values()]
+    heat_measure_label = st.selectbox('Heatmap measure', ['Record-category events', 'Unique records', 'Item changes'])
+    heat_measure = {'Record-category events': 'record_events', 'Unique records': 'unique_records', 'Item changes': 'item_changes'}[heat_measure_label]
+    types = [name for name, _ in sorted(((name, sum(row[heat_measure] for row in heat_rows if row['system_type'] == name))
+                                         for name in {row['system_type'] for row in heat_rows}), key=lambda pair: (-pair[1], pair[0]))]
+    labels = [category['label'] for category in data.content_categories(cfg)]
+    chart(heat_rows, 'heatmap', alt.X('content_category:N', sort=labels, title='Content category'),
+          alt.Y('system_type:N', sort=types, scale=alt.Scale(domain=types), title='System type'),
+          alt.Color(f'{heat_measure}:Q', title=heat_measure_label, scale=alt.Scale(scheme='blues', zero=True)),
+          ['system_type:N', 'content_category:N', 'record_events:Q', 'unique_records:Q', 'item_changes:Q'],
+          height=max(280, min(900, len(types)*34+100)))
+    st.caption('A record changed in several content categories appears once in each relevant cell. Item changes count description, parameter, relationship, and media entries; Metadata items are changed fields.')
+
+    st.subheader('Content changes over time')
+    time_measure_label = st.selectbox('Timeline measure', ['Record-category events', 'Item changes'], key='content_time_measure')
+    grouped = {}
+    for row in details:
+        key = row['observed_at'], row['content_category']
+        item = grouped.setdefault(key, {'observed_at': key[0], 'content_category': key[1], 'events': set(), 'item_changes': 0})
+        item['events'].add((row['snapshot_id'], row['record_id']))
+        item['item_changes'] += 1
+    timeline = [{'observed_at': item['observed_at'], 'content_category': item['content_category'],
+                 'record_events': len(item['events']), 'item_changes': item['item_changes']} for item in grouped.values()]
+    time_measure = 'record_events' if time_measure_label == 'Record-category events' else 'item_changes'
+    chart(timeline, 'bar', alt.X('observed_at:T', title='Observation (UTC)'),
+          alt.Y(f'{time_measure}:Q', title=time_measure_label, stack='zero'),
+          alt.Color('content_category:N', sort=labels, title='Content category'),
+          ['observed_at:T', 'content_category:N', 'record_events:Q', 'item_changes:Q'])
+
+    st.subheader('Descriptions: size of edits')
+    description_rows = [row for row in details if row['content_key'] == 'descriptions']
+    description_counts = []
+    for label, predicate in [
+        ('Added', lambda row: row['operation'] == 'added'),
+        ('Removed', lambda row: row['operation'] == 'removed'),
+        ('Small', lambda row: row['magnitude'] == 'Small'),
+        ('Medium', lambda row: row['magnitude'] == 'Medium'),
+        ('Large', lambda row: row['magnitude'] == 'Large'),
+        ('Other', lambda row: row['magnitude'] == 'Other'),
+    ]:
+        description_counts.append({'description_change': label, 'items': sum(predicate(row) for row in description_rows)})
+    chart(description_counts, 'bar', alt.X('items:Q', title='Description entries'),
+          alt.Y('description_change:N', sort=['Added', 'Removed', 'Small', 'Medium', 'Large', 'Other'], title=None),
+          tooltip=['description_change:N', 'items:Q'], height=230)
+    thresholds = cfg.get('description_edit_thresholds', {'small': 50, 'medium': 250})
+    st.caption(f"Modified description entries are Small below {thresholds['small']} edited words, Medium from {thresholds['small']} through {thresholds['medium']}, and Large above {thresholds['medium']}. “Other” means a description entry changed outside its text fields. Added and removed entries are shown separately.")
+
+    st.subheader('Item operations by content category')
+    operation_rows = []
+    for row in summary:
+        for operation in ('added', 'removed', 'modified'):
+            operation_rows.append({'content_category': row['content_category'], 'operation': operation.title(), 'items': row[operation]})
+    chart(operation_rows, 'bar', alt.X('items:Q', title='Items / metadata fields'),
+          alt.Y('content_category:N', sort=labels, title='Content category'),
+          alt.Color('operation:N', sort=['Added', 'Removed', 'Modified'], title='Operation'),
+          ['content_category:N', 'operation:N', 'items:Q'], height=260)
+    table(summary, 'content_change_summary')
+
+    st.subheader('Content change drill-down')
+    left, middle, right = st.columns(3)
+    category_options = sorted({row['content_category'] for row in details})
+    selected_categories = left.multiselect('Content categories', category_options, default=category_options)
+    operation_options = ['added', 'removed', 'modified']
+    selected_operations = middle.multiselect('Operations', operation_options, default=operation_options)
+    magnitude_options = ['Small', 'Medium', 'Large', 'Other', '(Not applicable)']
+    selected_magnitudes = right.multiselect('Description sizes', magnitude_options, default=magnitude_options)
+    search = st.text_input('Search record, item, field, system type or owner', key='content_search').casefold()
+    visible = [row for row in details if row['content_category'] in selected_categories
+               and row['operation'] in selected_operations
+               and (row['magnitude'] or '(Not applicable)') in selected_magnitudes
+               and search in ' '.join(str(row.get(key) or '') for key in
+                   ('record_id', 'record_name', 'item', 'changed_fields', 'system_type', 'model_owner')).casefold()]
+    columns = ['snapshot_id', 'observed_at', 'record_id', 'record_name', 'system_type', 'model_owner',
+               'content_category', 'item', 'operation', 'magnitude', 'word_edits', 'field_edits', 'changed_fields']
+    table([{key: row[key] for key in columns} for row in visible], 'content_change_details')
+    if visible:
+        selected = select_value('Inspect record event', range(len(visible)),
+            lambda index: f"#{visible[index]['snapshot_id']} · {visible[index]['record_name']} · {visible[index]['content_category']} · {visible[index]['item']}",
+            key='content_detail_'+fingerprint([(row['snapshot_id'], row['record_id'], row['item_path']) for row in visible]))
+        row = visible[selected]
+        event = next(item for item in modified if item['snapshot_id'] == row['snapshot_id'] and item['record_id'] == row['record_id'])
+        record_detail(path, stamp, cfg, snapshots, row['record_id'], event['previous_id'], event['snapshot_id'])
 
 
 def timing_scope(path, stamp, cfg_json, events, include_baseline):
@@ -376,7 +500,8 @@ def main():
     local = ROOT / 'config.json'
     if local.exists():
         display = json.loads(local.read_text(encoding='utf-8'))
-        for key in ('group_fields', 'type_fields', 'owner_fields', 'name_fields'):
+        for key in ('group_fields', 'type_fields', 'owner_fields', 'name_fields',
+                    'content_categories', 'description_edit_thresholds', 'array_keys'):
             if key in display:
                 cfg[key] = display[key]
     cfg_json = json.dumps(cfg, sort_keys=True)
@@ -400,6 +525,8 @@ def main():
         st.write('Group, type, and owner are read from the version at the event; removals use the previous version. Owner/category moves are attributed to the destination. Missing values are shown as (Unspecified). Population is the number of records present at an observation.')
     if st.session_state['view'] == 'Category trends':
         trends(totals, events, period, include_baseline)
+    elif st.session_state['view'] == 'Content changes':
+        content_changes_view(str(path), stamp, cfg, snapshots, events, include_baseline)
     elif st.session_state['view'] == 'Timing & scope':
         timing_scope(str(path), stamp, cfg_json, events, include_baseline)
     else:

@@ -10,6 +10,7 @@ from collections import Counter, defaultdict
 from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
+from urllib.parse import unquote
 
 import pandas as pd
 
@@ -18,6 +19,13 @@ from storage import dashboard_records, record_text
 UNKNOWN = '(Unspecified)'
 DIMENSIONS = {'System type': 'system_type', 'System group': 'system_group', 'Model owner': 'model_owner'}
 MEANINGFUL = ('added', 'removed', 'modified')
+DEFAULT_CONTENT_CATEGORIES = [
+    {'key': 'descriptions', 'label': 'Descriptions', 'paths': ['$.descriptions[]']},
+    {'key': 'parameters', 'label': 'Parameters', 'paths': ['$.parametrics[]']},
+    {'key': 'relationships', 'label': 'Relationships', 'paths': ['$.relations[]']},
+    {'key': 'media', 'label': 'Media', 'paths': ['$.media[]']},
+    {'key': 'metadata', 'label': 'Metadata', 'fallback': True},
+]
 
 
 class MissingRecord(Enum):
@@ -183,6 +191,168 @@ def field_scope(path, cfg, event_keys):
                     'unique_records': len(s['records']), 'record_events': len(s['events']),
                     'field_edits': s['edits'], 'snapshots': len(s['snapshots']), 'word_edits': s['words']}
                    for field, s in stats.items()], key=lambda r: (-r['unique_records'], r['field']))
+
+
+def content_categories(cfg):
+    categories = cfg.get('content_categories', DEFAULT_CONTENT_CATEGORIES)
+    if not isinstance(categories, list) or not categories:
+        raise ValueError('content_categories must be a non-empty list')
+    result = []
+    seen = set()
+    fallback = None
+    for category in categories:
+        key, label = category.get('key'), category.get('label')
+        if not isinstance(key, str) or not key or key in seen or not isinstance(label, str) or not label:
+            raise ValueError('Each content category needs a unique non-empty key and label')
+        seen.add(key)
+        paths = category.get('paths', [])
+        if not isinstance(paths, list) or not all(isinstance(item, str) and item.startswith('$.') for item in paths):
+            raise ValueError(f'Content category {key!r} has invalid paths')
+        item = {'key': key, 'label': label, 'paths': paths, 'fallback': bool(category.get('fallback'))}
+        if item['fallback']:
+            if fallback is not None:
+                raise ValueError('Only one content category may be the fallback')
+            fallback = item
+        else:
+            result.append(item)
+    if fallback is None:
+        fallback = {'key': 'other', 'label': 'Other', 'paths': [], 'fallback': True}
+    return result + [fallback]
+
+
+def content_category(json_path, categories):
+    normalized = re.sub(r'\[[^]]*\]', '[]', json_path)
+    for category in categories:
+        if category['fallback']:
+            continue
+        if any(normalized == path or (path.endswith('[]') and normalized == path[:-2])
+               or normalized.startswith(path+'.') or normalized.startswith(path+'[')
+               for path in category['paths']):
+            return category
+    return next(category for category in categories if category['fallback'])
+
+
+def content_item_path(json_path):
+    """Collapse array leaf changes to one array item; retain scalar field paths."""
+    bracket = json_path.find('[')
+    if bracket < 0:
+        return json_path
+    end = json_path.find(']', bracket)
+    return json_path if end < 0 else json_path[:end+1]
+
+
+def content_item_label(item_path):
+    bracket = item_path.find('[')
+    if bracket < 0:
+        return item_path.removeprefix('$.')
+    raw = item_path[bracket+1:-1]
+    if raw.isdigit():
+        return f'Item {int(raw)+1}'
+    values = []
+    for part in raw.split(','):
+        if '=' not in part:
+            continue
+        field, encoded = part.split('=', 1)
+        decoded = unquote(encoded)
+        try:
+            value = json.loads(decoded)
+        except json.JSONDecodeError:
+            value = decoded
+        if value not in (None, ''):
+            values.append(f'{field}: {value}' if len(raw.split(',')) > 1 else str(value))
+    return ' · '.join(values) or raw
+
+
+def content_change_details(path, cfg, events):
+    """Collapse changed leaves into category/item operations for modified records.
+
+    Whole-record additions/removals intentionally have no item operations: their
+    contents are initial/final inventory rather than editing activity.
+    """
+    event_map = {(row['snapshot_id'], row['record_id']): row for row in events if row['kind'] == 'modified'}
+    if not event_map:
+        return []
+    categories = content_categories(cfg)
+    groups = {}
+    with connect(path) as db:
+        db.execute('CREATE TEMP TABLE selected_events(snapshot_id INTEGER,record_id TEXT,PRIMARY KEY(snapshot_id,record_id))')
+        db.executemany('INSERT OR IGNORE INTO selected_events VALUES(?,?)', event_map)
+        rows = db.execute('''SELECT f.snapshot_id,f.record_id,f.json_path,f.old_value,f.new_value,f.word_edits
+            FROM field_changes f JOIN selected_events e USING(snapshot_id,record_id)
+            WHERE f.schema_only=0 ORDER BY f.snapshot_id,f.record_id,f.json_path''')
+        for row in rows:
+            category = content_category(row['json_path'], categories)
+            item_path = content_item_path(row['json_path'])
+            key = row['snapshot_id'], row['record_id'], category['key'], item_path
+            item = groups.setdefault(key, {'snapshot_id': row['snapshot_id'], 'record_id': row['record_id'],
+                'content_key': category['key'], 'content_category': category['label'], 'item_path': item_path,
+                'item': content_item_label(item_path), 'field_edits': 0, 'word_edits': 0,
+                'has_word_edit': False, 'all_old_missing': True, 'all_new_missing': True,
+                'changed_fields': set()})
+            item['field_edits'] += 1
+            item['changed_fields'].add(row['json_path'].rsplit('.', 1)[-1])
+            item['all_old_missing'] &= row['old_value'] is None
+            item['all_new_missing'] &= row['new_value'] is None
+            if row['word_edits'] is not None:
+                item['has_word_edit'] = True
+                item['word_edits'] += row['word_edits']
+    thresholds = cfg.get('description_edit_thresholds', {'small': 50, 'medium': 250})
+    result = []
+    for item in groups.values():
+        array_base = item['item_path'].split('[', 1)[0] if '[' in item['item_path'] else None
+        key_spec = cfg.get('array_keys', {}).get(array_base) if array_base else None
+        identity_fields = {key_spec} if isinstance(key_spec, str) else set(key_spec or [])
+        identity_changed = bool(identity_fields & item['changed_fields'])
+        is_array_item = array_base is not None
+        if item['all_old_missing'] and (identity_changed or not is_array_item):
+            operation = 'added'
+        elif item['all_new_missing'] and (identity_changed or not is_array_item):
+            operation = 'removed'
+        else:
+            operation = 'modified'
+        magnitude = None
+        if item['content_key'] == 'descriptions' and operation == 'modified':
+            if not item['has_word_edit']:
+                magnitude = 'Other'
+            elif item['word_edits'] < int(thresholds['small']):
+                magnitude = 'Small'
+            elif item['word_edits'] <= int(thresholds['medium']):
+                magnitude = 'Medium'
+            else:
+                magnitude = 'Large'
+        event = event_map[item['snapshot_id'], item['record_id']]
+        item.update({'operation': operation, 'magnitude': magnitude,
+                     'observed_at': event['created_at'], 'estimated_at': event.get('estimated_at'),
+                     'record_name': event['record_name'], 'system_group': event['system_group'],
+                     'system_type': event['system_type'], 'model_owner': event['model_owner']})
+        item.pop('all_old_missing')
+        item.pop('all_new_missing')
+        item.pop('has_word_edit')
+        item['changed_fields'] = ', '.join(sorted(item['changed_fields']))
+        result.append(item)
+    return sorted(result, key=lambda row: (row['snapshot_id'], row['record_id'], row['content_category'], row['item']))
+
+
+def content_change_summary(details):
+    stats = defaultdict(lambda: {'records': set(), 'record_events': set(), 'items': 0,
+                                 'added': 0, 'removed': 0, 'modified': 0,
+                                 'small': 0, 'medium': 0, 'large': 0, 'other': 0, 'words': 0})
+    for row in details:
+        item = stats[row['content_category']]
+        item['records'].add(row['record_id'])
+        item['record_events'].add((row['snapshot_id'], row['record_id']))
+        item['items'] += 1
+        item[row['operation']] += 1
+        if row['magnitude']:
+            item[row['magnitude'].lower()] += 1
+        item['words'] += row['word_edits']
+    return sorted([{'content_category': category, 'unique_records': len(item['records']),
+                    'record_events': len(item['record_events']), 'item_changes': item['items'],
+                    'added': item['added'], 'removed': item['removed'], 'modified': item['modified'],
+                    'small_description_edits': item['small'], 'medium_description_edits': item['medium'],
+                    'large_description_edits': item['large'], 'other_description_edits': item['other'],
+                    'word_edits': item['words']}
+                   for category, item in stats.items()], key=lambda row: (-row['record_events'], row['content_category']))
 
 
 def record_page(path, cfg, snapshot_id, filters, search='', page=0, size=50):
