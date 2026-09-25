@@ -15,7 +15,14 @@ import streamlit as st
 import dashboard_data as data
 
 ROOT = Path(__file__).resolve().parent
-VIEWS = ['Category trends', 'Content changes', 'Timing & scope', 'Change explorer', 'Storage & health']
+VIEW_OVERVIEW = 'Where changes are happening'
+VIEW_CONTENT = 'What changed'
+VIEW_TIMING = 'When changes happened'
+VIEW_EXPLORE = 'Explore records'
+VIEW_HEALTH = 'History health'
+VIEWS = [VIEW_OVERVIEW, VIEW_CONTENT, VIEW_TIMING, VIEW_EXPLORE, VIEW_HEALTH]
+LEGACY_VIEWS = dict(zip(
+    ['Category trends', 'Content changes', 'Timing & scope', 'Change explorer', 'Storage & health'], VIEWS))
 FILTER_KEYS = {'system_group': 'filter_groups', 'system_type': 'filter_types', 'model_owner': 'filter_owners'}
 st.set_page_config(page_title='Database change observatory', page_icon='◷', layout='wide')
 
@@ -113,11 +120,11 @@ def reset_filters():
 
 def drill_category(dimension, category):
     st.session_state[FILTER_KEYS[dimension]] = [category]
-    st.session_state['view'] = 'Change explorer'
+    st.session_state['view'] = VIEW_EXPLORE
 
 
 def trends(totals, events, period, include_baseline):
-    st.header('Scale and concentration of change')
+    st.header('Where are changes happening?')
     controls = st.columns([1, 1, 1])
     dimension_label = controls[0].selectbox('Compare categories by', list(data.DIMENSIONS))
     dimension = data.DIMENSIONS[dimension_label]
@@ -136,7 +143,7 @@ def trends(totals, events, period, include_baseline):
     labels = {r['id']: f"#{r['id']} · {r['created_at'][:16].replace('T', ' ')}" for r in period}
     for row in shown:
         row['observation'] = labels[row['snapshot_id']]
-    st.subheader('Category × observation')
+    st.subheader('How is change distributed over time?')
     ranking = {'population': 'end population', 'events': 'event count', 'affected_percent': 'peak affected percentage'}[measure]
     st.caption(f'Categories are ranked by {ranking}. Every observation is compared with its own predecessor, including the first observation in the selected range.')
     chart(shown, 'heatmap', alt.X('observation:N', sort=list(labels.values()), title='Observation (UTC)', axis=alt.Axis(labelAngle=-40)),
@@ -150,12 +157,12 @@ def trends(totals, events, period, include_baseline):
     chart(line_rows, 'line', alt.X('observation:N', sort=list(labels.values()), title='Observation sequence (UTC)', axis=alt.Axis(labelAngle=-40)),
           alt.Y(f'{measure}:Q', title=measure_label), alt.Color('category:N', title=dimension_label),
           ['category:N', 'snapshot_id:O', 'observed_at:T', alt.Tooltip(f'{measure}:Q', format='.1f')])
-    st.subheader('Category scope')
+    st.subheader('How much did each category change?')
     st.caption('Unique records count each ID once per category during the period; events count repeated changes. Population delta compares the first and last selected observations and includes category/owner transfers.')
     table(summary, 'category_scope')
     category = st.selectbox('Inspect category', [r['category'] for r in summary])
     st.button('Explore changes in this category', on_click=drill_category, args=(dimension, category))
-    st.subheader('System types by model owner')
+    st.subheader('Which owners and system types changed?')
     active = data.meaningful(events, include_baseline)
     owners = {}
     for r in active:
@@ -169,7 +176,7 @@ def trends(totals, events, period, include_baseline):
 
 
 def content_changes_view(path, stamp, cfg, snapshots, events, include_baseline):
-    st.header('Changes by JSON content category')
+    st.header('What changed inside the records?')
     active = data.meaningful(events, include_baseline)
     # Item-level history exists for modified records. Whole-record additions
     # and removals remain separate inventory events by design.
@@ -193,7 +200,7 @@ def content_changes_view(path, stamp, cfg, snapshots, events, include_baseline):
         st.info('No field-level content changes match this selection. Added and removed whole records are shown above; schema-only changes are excluded.')
         return
 
-    st.subheader('Content category × system type')
+    st.subheader('Which content changed in each system type?')
     heat = {}
     for row in details:
         key = row['system_type'], row['content_category']
@@ -216,7 +223,7 @@ def content_changes_view(path, stamp, cfg, snapshots, events, include_baseline):
           height=max(280, min(900, len(types)*34+100)))
     st.caption('A record changed in several content categories appears once in each relevant cell. Item changes count description, parameter, relationship, and media entries; Metadata items are changed fields.')
 
-    st.subheader('Content changes over time')
+    st.subheader('When did each kind of content change?')
     time_measure_label = st.selectbox('Timeline measure', ['Record-category events', 'Item changes'], key='content_time_measure')
     grouped = {}
     for row in details:
@@ -232,7 +239,7 @@ def content_changes_view(path, stamp, cfg, snapshots, events, include_baseline):
           alt.Color('content_category:N', sort=labels, title='Content category'),
           ['observed_at:T', 'content_category:N', 'record_events:Q', 'item_changes:Q'])
 
-    st.subheader('Descriptions: size of edits')
+    st.subheader('How substantial were the description edits?')
     description_rows = [row for row in details if row['content_key'] == 'descriptions']
     description_counts = []
     for label, predicate in [
@@ -250,7 +257,7 @@ def content_changes_view(path, stamp, cfg, snapshots, events, include_baseline):
     thresholds = cfg.get('description_edit_thresholds', {'small': 50, 'medium': 250})
     st.caption(f"Modified description entries are Small below {thresholds['small']} edited words, Medium from {thresholds['small']} through {thresholds['medium']}, and Large above {thresholds['medium']}. “Other” means a description entry changed outside its text fields. Added and removed entries are shown separately.")
 
-    st.subheader('Item operations by content category')
+    st.subheader('Were items added, removed or modified?')
     operation_rows = []
     for row in summary:
         for operation in ('added', 'removed', 'modified'):
@@ -261,7 +268,7 @@ def content_changes_view(path, stamp, cfg, snapshots, events, include_baseline):
           ['content_category:N', 'operation:N', 'items:Q'], height=260)
     table(summary, 'content_change_summary')
 
-    st.subheader('Content change drill-down')
+    st.subheader('Explore the underlying content changes')
     left, middle, right = st.columns(3)
     category_options = sorted({row['content_category'] for row in details})
     selected_categories = left.multiselect('Content categories', category_options, default=category_options)
@@ -288,7 +295,7 @@ def content_changes_view(path, stamp, cfg, snapshots, events, include_baseline):
 
 
 def timing_scope(path, stamp, cfg_json, events, include_baseline):
-    st.header('Timing and scope')
+    st.header('When did changes happen?')
     a, b = st.columns(2)
     clock = a.radio('Time basis', ['Observed', 'Estimated'], horizontal=True)
     bucket = b.selectbox('Group timing by', ['Day', 'Week', 'Month'])
@@ -300,9 +307,9 @@ def timing_scope(path, stamp, cfg_json, events, include_baseline):
         table(rows, 'timing')
     active = data.meaningful(events, include_baseline)
     counts = [{'change': kind.title(), 'events': sum(r['kind'] == kind for r in active)} for kind in data.MEANINGFUL]
-    st.subheader('Composition of change')
+    st.subheader('What kinds of change occurred?')
     chart(counts, 'bar', alt.X('events:Q', title='Change events'), alt.Y('change:N', title=None), height=160)
-    st.subheader('Fields driving the changes')
+    st.subheader('Which fields changed most?')
     keys = tuple((r['snapshot_id'], r['record_id']) for r in active)
     with st.spinner('Aggregating changed fields…'):
         fields = load_fields(path, stamp, cfg_json, keys)
@@ -311,7 +318,7 @@ def timing_scope(path, stamp, cfg_json, events, include_baseline):
           alt.Y('field:N', sort='-x', title='Field (top 20)'),
           tooltip=['field:N', 'unique_records:Q', 'record_events:Q', 'field_edits:Q', 'word_edits:Q'], height=max(180, min(600, len(fields)*25)))
     table(fields, 'field_scope')
-    st.subheader('Category and owner transfers')
+    st.subheader('Which records moved between categories or owners?')
     transfers = []
     for row in active:
         if row['kind'] != 'modified':
@@ -382,7 +389,7 @@ def record_detail(path, stamp, cfg, snapshots, record_id, default_before=None, d
 
 
 def explorer(path, stamp, cfg, snapshots, period, events, filters, include_baseline):
-    st.header('Changes behind the category trends')
+    st.header('Explore changes and individual records')
     mode = st.radio('Explore', ['Change events', 'All records at an observation'], horizontal=True)
     search = st.text_input('Search record ID, name or source', key='event_search').casefold()
     cfg_json = json.dumps(cfg, sort_keys=True)
@@ -441,7 +448,7 @@ def explorer(path, stamp, cfg, snapshots, period, events, filters, include_basel
 
 
 def storage_health(path, snapshots):
-    st.header('Storage and observation health')
+    st.header('Is the history complete and compact?')
     stats = data.storage_stats(path)
     a, b, c = st.columns(3)
     a.metric('Database size', f"{stats['database_bytes']/1_000_000:,.1f} MB")
@@ -464,8 +471,8 @@ def storage_health(path, snapshots):
 
 
 def main():
-    st.title('Database change observatory')
-    st.caption('Understand the scale, scope and timing of changes across system types, groups and model owners.')
+    st.title('How is the database changing?')
+    st.caption('See where changes are happening, what changed, and when it happened across system types, groups and model owners.')
     path = Path(st.sidebar.text_input('History database', str(ROOT / 'json_history' / 'history.sqlite3'))).resolve()
     if not path.is_file():
         st.info('Create a snapshot first with version_json.py, or select an existing history database.')
@@ -480,8 +487,10 @@ def main():
     if st.session_state.get('active_database') != signature:
         reset_filters()
         st.session_state['active_database'] = signature
+    if st.session_state.get('view') in LEGACY_VIEWS:
+        st.session_state['view'] = LEGACY_VIEWS[st.session_state['view']]
     st.sidebar.radio('View', VIEWS, key='view')
-    if st.session_state['view'] == 'Storage & health':
+    if st.session_state['view'] == VIEW_HEALTH:
         storage_health(str(path), snapshots)
         return
     by_id = {r['id']: r for r in snapshots}
@@ -523,11 +532,11 @@ def main():
     with st.expander('How to read these measures'):
         st.write('A change event is one added, removed, or meaningfully modified record at one observation. Repeated changes count as multiple events; unique records count each ID once across the selected period. Schema-only and source-move events are available in the explorer but excluded from these impact metrics.')
         st.write('Group, type, and owner are read from the version at the event; removals use the previous version. Owner/category moves are attributed to the destination. Missing values are shown as (Unspecified). Population is the number of records present at an observation.')
-    if st.session_state['view'] == 'Category trends':
+    if st.session_state['view'] == VIEW_OVERVIEW:
         trends(totals, events, period, include_baseline)
-    elif st.session_state['view'] == 'Content changes':
+    elif st.session_state['view'] == VIEW_CONTENT:
         content_changes_view(str(path), stamp, cfg, snapshots, events, include_baseline)
-    elif st.session_state['view'] == 'Timing & scope':
+    elif st.session_state['view'] == VIEW_TIMING:
         timing_scope(str(path), stamp, cfg_json, events, include_baseline)
     else:
         explorer(str(path), stamp, cfg, snapshots, period, events, filters, include_baseline)

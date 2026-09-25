@@ -6,7 +6,7 @@ The dashboard is organised around comparing **system types**, with system group 
 
 `mockups/category-trends.html` contains three interactive mockup states: category trends, timing/scope, and category drill-down. They use clearly labelled illustrative data, with local owner/group filtering. The design choices carry into the Streamlit implementation, which uses native controls and charts rather than copying the mockup's exact CSS.
 
-The implemented views are Category trends, Content changes, Timing & scope, Change explorer, and Storage & health. Only the active view executes its detailed queries. Root-level `modelOwner` is filtered and displayed alongside system group/type. Missing owner values remain visible as `(Unspecified)`; no owners were invented or injected into existing user records.
+The implemented views are Where changes are happening, What changed, When changes happened, Explore records, and History health. Only the active view executes its detailed queries. Root-level `modelOwner` is filtered and displayed alongside system group/type. Missing owner values remain visible as `(Unspecified)`; no owners were invented or injected into existing user records.
 
 ## Separation of responsibilities
 
