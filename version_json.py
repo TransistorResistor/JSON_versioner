@@ -8,9 +8,11 @@ import datetime as dt
 import difflib
 import hashlib
 import json
+import random
 import re
 import sqlite3
 import sys
+import time
 from contextlib import ExitStack
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -329,11 +331,13 @@ def https_session():
     return session
 
 
-def scan_urls(source, cfg, template, column, timeout, prefix=None, result=None, session=None):
+def scan_urls(source, cfg, template, column, timeout, prefix=None, result=None, session=None,
+              entries=None, timings=None):
     if session is None:
         with https_session() as owned_session:
-            return scan_urls(source, cfg, template, column, timeout, prefix, result, owned_session)
-    entries = source_entries(source, column)
+            return scan_urls(source, cfg, template, column, timeout, prefix, result, owned_session,
+                             entries, timings)
+    entries = source_entries(source, column) if entries is None else entries
     result = {} if result is None else result
     errors = []
     if template and '{modelID}' not in template and '{id}' not in template:
@@ -343,6 +347,8 @@ def scan_urls(source, cfg, template, column, timeout, prefix=None, result=None, 
     if has_ids and not template and not prefix:
         raise ValueError('ID list needs url_prefix in config.json, --url-prefix, or --url-template')
     for number, (line, item) in enumerate(entries, 1):
+        started = time.perf_counter()
+        timing = {'row': line}
         supplied_url = urlparse(item).scheme in ('http', 'https')
         if supplied_url:
             url = item
@@ -353,16 +359,26 @@ def scan_urls(source, cfg, template, column, timeout, prefix=None, result=None, 
         parsed = urlparse(url)
         if parsed.scheme != 'https' or not parsed.netloc:
             errors.append(f'row {line}: expected an HTTPS URL; configure url_prefix or use --url-template for modelIDs')
+            if timings is not None:
+                timing.update({'error': 'invalid HTTPS URL', 'total_seconds': time.perf_counter()-started})
+                timings.append(timing)
             continue
         try:
             with session.get(url, timeout=(min(timeout, 10), timeout), stream=True) as response:
+                headers_at = time.perf_counter()
+                timing['status'] = response.status_code
+                retry_state = getattr(getattr(response, 'raw', None), 'retries', None)
+                retry_history = getattr(retry_state, 'history', ())
+                timing['retries'] = len(retry_history) if isinstance(retry_history, (list, tuple)) else 0
                 response.raise_for_status()
                 payload = bytearray()
                 for chunk in response.iter_content(chunk_size=65536):
                     payload.extend(chunk)
                     if len(payload) > 20_000_000:
                         raise ValueError('response exceeds 20 MB (after decompression)')
+            body_at = time.perf_counter()
             raw = json.loads(payload.decode('utf-8-sig'))
+            parsed_at = time.perf_counter()
             if not isinstance(raw, dict):
                 raise ValueError('expected one JSON object per URL')
             rid = identity(raw, url, cfg)
@@ -375,12 +391,71 @@ def scan_urls(source, cfg, template, column, timeout, prefix=None, result=None, 
             if rid in result:
                 raise ValueError(f'duplicate record ID {rid} (also {result[rid][0]})')
             value = normalize(raw, cfg)
-            result[rid] = (url, value, digest(value), reported_update(raw, cfg))
+            normalized_at = time.perf_counter()
+            hash_ = digest(value)
+            hashed_at = time.perf_counter()
+            result[rid] = (url, value, hash_, reported_update(raw, cfg))
+            completed_at = time.perf_counter()
+            if timings is not None:
+                timing.update({'bytes': len(payload),
+                               'request_wait_seconds': headers_at-started,
+                               'download_seconds': body_at-headers_at,
+                               'json_parse_seconds': parsed_at-body_at,
+                               'normalize_seconds': normalized_at-parsed_at,
+                               'hash_seconds': hashed_at-normalized_at,
+                               'stage_seconds': completed_at-hashed_at,
+                               'total_seconds': completed_at-started})
+                timings.append(timing)
         except (requests.RequestException, TimeoutError, ValueError, UnicodeError, OSError) as exc:
             errors.append(f'row {line}, {url}: {exc}')
-        if number % 100 == 0:
-            print(f'Fetched {number}/{len(entries)} URLs', flush=True)
+            if timings is not None:
+                timing.update({'error': str(exc), 'total_seconds': time.perf_counter()-started})
+                timings.append(timing)
+        if number % 10 == 0 or number == len(entries):
+            elapsed = time.perf_counter()-started
+            print(f'Fetched {number}/{len(entries)} URLs (last: {elapsed:.2f}s)', flush=True)
     return result, errors
+
+
+def benchmark_urls(args):
+    """Time a random, read-only URL sample without creating a snapshot."""
+    source = args.source.resolve()
+    if not source.is_file():
+        raise ValueError('--benchmark requires a .txt, .csv, .xlsx, or .json URL/ID list')
+    cfg = config(args.config.resolve())
+    entries = source_entries(source, args.column)
+    sample_size = min(args.benchmark, len(entries))
+    sampled = random.SystemRandom().sample(entries, sample_size)
+    timings = []
+    started = time.perf_counter()
+    with ExitStack() as resources:
+        staged = StagedRecords()
+        resources.callback(staged.close)
+        with https_session() as session:
+            _, errors = scan_urls(source, cfg, args.url_template, args.column, args.timeout,
+                                  args.url_prefix, staged, session, sampled, timings)
+    successful = [row for row in timings if 'error' not in row]
+    phase_names = ('request_wait_seconds', 'download_seconds', 'json_parse_seconds',
+                   'normalize_seconds', 'hash_seconds', 'stage_seconds')
+    phase_totals = {name: round(sum(row.get(name, 0) for row in successful), 3) for name in phase_names}
+    dominant = max(phase_totals, key=phase_totals.get) if successful else None
+    report = {
+        'mode': 'read-only random sample; no history snapshot was written',
+        'sampled_records': sample_size,
+        'successful_records': len(successful),
+        'failed_records': len(errors),
+        'wall_seconds': round(time.perf_counter()-started, 3),
+        'https_sessions': 1,
+        'requests_are_sequential': True,
+        'retries_observed': sum(row.get('retries', 0) for row in timings),
+        'dominant_success_phase': dominant,
+        'phase_total_seconds': phase_totals,
+        'records': [{key: round(value, 3) if isinstance(value, float) else value
+                     for key, value in row.items()} for row in timings],
+    }
+    print(json.dumps(report, indent=2), flush=True)
+    if errors:
+        print('\n'.join(errors[:20]), file=sys.stderr)
 
 
 def schema_paths(pending, comparable_count, cfg):
@@ -514,12 +589,16 @@ def main():
     parser.add_argument('--url-prefix', help='Override config url_prefix for modelID entries')
     parser.add_argument('--column', help='CSV/Excel column or JSON object key; auto-detected by default')
     parser.add_argument('--timeout', type=float, default=20, help='Read inactivity timeout in seconds (default: 20); connect timeout capped at 10')
+    parser.add_argument('--benchmark', nargs='?', const=10, type=int, metavar='N',
+                        help='Time a random read-only sample of N URL records (default: 10) without writing history')
     parser.add_argument('--list', action='store_true', help='Show snapshot history')
     parser.add_argument('--compact-storage', action='store_true', help='Back up, compress/deduplicate legacy records, and reclaim free space')
     args = parser.parse_args()
     try:
         if args.timeout <= 0:
             raise ValueError('--timeout must be positive')
+        if args.benchmark is not None and args.benchmark <= 0:
+            raise ValueError('--benchmark sample size must be positive')
         if args.compact_storage:
             path = args.history / 'history.sqlite3'
             if not path.is_file():
@@ -536,6 +615,8 @@ def main():
                 print(*row, sep=' | ')
             if db:
                 db.close()
+        elif args.source and args.benchmark is not None:
+            benchmark_urls(args)
         elif args.source:
             run(args)
         else:

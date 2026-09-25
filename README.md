@@ -83,6 +83,16 @@ One Requests session is reused for each URL-list run, with connection pooling, n
 
 Use HTTPS in your URL list, prefix, and template. For an internal certificate authority, set `REQUESTS_CA_BUNDLE` to a trusted PEM CA bundle; certificate verification is never disabled by the CLI. This secures outgoing data requests; it does not configure TLS for the Streamlit dashboard server.
 
+To diagnose a slow URL run without writing history, benchmark a random sample of ten records:
+
+```powershell
+python version_json.py .\modelIDs.csv --benchmark
+# Choose a different sample size:
+python version_json.py .\modelIDs.csv --benchmark 20
+```
+
+The report separates time waiting for response headers, downloading the body, parsing JSON, normalising, hashing, and temporary staging/compression. It also reports retries observed by the HTTPS adapter. The sample uses one reusable HTTPS session and the same sequential request path as a normal run. Normal runs report progress every ten records, including the duration of the most recent record.
+
 ## Existing databases and storage size
 
 Existing history stays readable. New snapshots use compressed payloads immediately, while old full-text rows remain until explicitly converted:
