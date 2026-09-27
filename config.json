@@ -26,6 +26,7 @@
     {"key": "metadata", "label": "Metadata", "fallback": true}
   ],
   "description_edit_thresholds": {"small": 50, "medium": 250},
+  "combined_update_size": {"small_max": 4, "medium_max": 15},
   "important_fields": {"$.status": 3, "$.owner": 2, "$.classification": 3},
   "change_thresholds": {"tiny": 0.02, "small": 0.10, "medium": 0.40},
   "schema_field_fraction": 0.9,

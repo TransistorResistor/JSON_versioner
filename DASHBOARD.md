@@ -32,6 +32,7 @@ All application connections use SQLite `mode=ro`. Temporary classification views
 10. **Content taxonomy:** map `descriptions`, `parametrics`, `relations`, and `media` arrays to Descriptions, Parameters, Relationships, and Media. The fallback is Metadata, which deliberately includes `proliferations`, aliases, codes, and other root fields.
 11. **Content operations:** group changed leaves by record, observation, category, and keyed-array item. Several changed fields on one item count as one modification. Whole-record additions/removals stay separate because their contents represent inventory entering/leaving the dataset rather than editing activity.
 12. **Description magnitude:** count edited words across each modified description item. Small is below 50, Medium is 50 through 250, and Large is above 250 by default. Added/removed descriptions are distinct operations; non-text description changes are Other.
+13. **Combined update size:** assign one change unit to each changed parameter, relationship, media item, or metadata item/field. Descriptions contribute 1, 5, or 16 units to preserve their word-based size band. Sum the units within each modified record event: Small is 1–4, Medium is 5–15, and Large is 16 or more. Whole-record additions and removals remain separate inventory events.
 
 ## Performance boundaries
 

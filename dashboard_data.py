@@ -26,6 +26,7 @@ DEFAULT_CONTENT_CATEGORIES = [
     {'key': 'media', 'label': 'Media', 'paths': ['$.media[]']},
     {'key': 'metadata', 'label': 'Metadata', 'fallback': True},
 ]
+DEFAULT_COMBINED_UPDATE_SIZE = {'small_max': 4, 'medium_max': 15}
 
 
 class MissingRecord(Enum):
@@ -353,6 +354,56 @@ def content_change_summary(details):
                     'large_description_edits': item['large'], 'other_description_edits': item['other'],
                     'word_edits': item['words']}
                    for category, item in stats.items()], key=lambda row: (-row['record_events'], row['content_category']))
+
+
+def combined_update_sizes(details, cfg):
+    """Combine logical item changes into one auditable size per record update.
+
+    Each non-description item is one change unit. A description contributes
+    enough units to retain its word-based Small, Medium, or Large band.
+    """
+    settings = cfg.get('combined_update_size', DEFAULT_COMBINED_UPDATE_SIZE)
+    description_settings = cfg.get('description_edit_thresholds', {'small': 50, 'medium': 250})
+    try:
+        small_max = int(settings['small_max'])
+        medium_max = int(settings['medium_max'])
+        description_small = int(description_settings['small'])
+        description_medium = int(description_settings['medium'])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError('Combined update and description thresholds must be integers') from exc
+    if small_max < 1 or medium_max <= small_max or description_small < 1 or description_medium < description_small:
+        raise ValueError('Update size thresholds must increase from Small to Medium to Large')
+    groups = {}
+    category_keys = [category['key'] for category in content_categories(cfg)]
+    for row in details:
+        key = row['snapshot_id'], row['record_id']
+        event = groups.setdefault(key, {
+            'snapshot_id': row['snapshot_id'], 'observed_at': row['observed_at'],
+            'record_id': row['record_id'], 'record_name': row['record_name'],
+            'system_group': row['system_group'], 'system_type': row['system_type'],
+            'model_owner': row['model_owner'], 'change_units': 0, 'item_changes': 0,
+            'description_word_edits': 0, 'added': 0, 'removed': 0, 'modified': 0,
+            **{f'{category}_changes': 0 for category in category_keys},
+        })
+        units = 1
+        if row['content_key'] == 'descriptions':
+            event['description_word_edits'] += row['word_edits']
+            if row['word_edits'] >= description_small:
+                units = small_max + 1
+            if row['word_edits'] > description_medium:
+                units = medium_max + 1
+        event['change_units'] += units
+        event['item_changes'] += 1
+        event[row['operation']] += 1
+        event[f"{row['content_key']}_changes"] += 1
+    for event in groups.values():
+        if event['change_units'] <= small_max:
+            event['overall_update_size'] = 'Small'
+        elif event['change_units'] <= medium_max:
+            event['overall_update_size'] = 'Medium'
+        else:
+            event['overall_update_size'] = 'Large'
+    return sorted(groups.values(), key=lambda row: (row['snapshot_id'], row['record_id']))
 
 
 def record_page(path, cfg, snapshot_id, filters, search='', page=0, size=50):

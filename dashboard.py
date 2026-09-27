@@ -186,19 +186,44 @@ def content_changes_view(path, stamp, cfg, snapshots, events, include_baseline):
     with st.spinner('Classifying changed JSON fields…'):
         details = load_content_changes(path, stamp, cfg_json, events_json)
     summary = data.content_change_summary(details)
+    overall_updates = data.combined_update_sizes(details, cfg)
     additions = sum(row['kind'] == 'added' for row in active)
     removals = sum(row['kind'] == 'removed' for row in active)
-    record_category_events = {(row['snapshot_id'], row['record_id'], row['content_key']) for row in details}
-    description_large = sum(row['content_key'] == 'descriptions' and row['magnitude'] == 'Large' for row in details)
+    substantial = sum(row['overall_update_size'] in ('Medium', 'Large') for row in overall_updates)
     a, b, c, d = st.columns(4)
     a.metric('Records with categorised edits', f"{len({row['record_id'] for row in details}):,}")
-    b.metric('Record-category events', f'{len(record_category_events):,}')
-    c.metric('Item / metadata changes', f'{len(details):,}')
-    d.metric('Large description edits', f'{description_large:,}')
+    b.metric('Modified record events', f'{len(overall_updates):,}')
+    c.metric('Logical item changes', f'{len(details):,}')
+    d.metric('Medium or large updates', f'{substantial:,}')
     st.caption(f'{additions:,} whole records added and {removals:,} removed in this selection. Their initial/final contents are excluded from item-operation totals, so record inventory changes do not swamp editing activity.')
     if not details:
         st.info('No field-level content changes match this selection. Added and removed whole records are shown above; schema-only changes are excluded.')
         return
+
+    st.subheader('How large were the updates overall?')
+    size_order = ['Small', 'Medium', 'Large']
+    size_rows = [{'overall_update_size': size,
+                  'record_updates': sum(row['overall_update_size'] == size for row in overall_updates)}
+                 for size in size_order]
+    chart(size_rows, 'bar', alt.X('overall_update_size:N', sort=size_order, title='Overall update size'),
+          alt.Y('record_updates:Q', title='Modified record events'),
+          alt.Color('overall_update_size:N', sort=size_order, title='Overall update size',
+                    scale=alt.Scale(domain=size_order, range=['#5B8FF9', '#F6BD16', '#E8684A'])),
+          ['overall_update_size:N', 'record_updates:Q'], height=280)
+    combined_thresholds = cfg.get('combined_update_size', {'small_max': 4, 'medium_max': 15})
+    description_thresholds = cfg.get('description_edit_thresholds', {'small': 50, 'medium': 250})
+    st.caption(
+        f"Each changed parameter, relationship, media item, or metadata item/field contributes one change unit. "
+        f"A description contributes 1 unit below {description_thresholds['small']} edited words, "
+        f"{int(combined_thresholds['small_max'])+1} units from {description_thresholds['small']} through "
+        f"{description_thresholds['medium']}, and {int(combined_thresholds['medium_max'])+1} units above that. "
+        f"Overall updates are Small through {combined_thresholds['small_max']} units, Medium through "
+        f"{combined_thresholds['medium_max']}, and Large above that.")
+    with st.expander('See how each update was sized'):
+        category_columns = [f"{category['key']}_changes" for category in data.content_categories(cfg)]
+        impact_columns = ['snapshot_id', 'observed_at', 'record_id', 'record_name', 'system_type', 'model_owner',
+                          'overall_update_size', 'change_units', 'item_changes', 'description_word_edits'] + category_columns
+        table([{key: row[key] for key in impact_columns} for row in overall_updates], 'combined_update_sizes')
 
     st.subheader('Which content changed in each system type?')
     heat = {}
@@ -269,22 +294,31 @@ def content_changes_view(path, stamp, cfg, snapshots, events, include_baseline):
     table(summary, 'content_change_summary')
 
     st.subheader('Explore the underlying content changes')
-    left, middle, right = st.columns(3)
+    left, middle, right, fourth = st.columns(4)
     category_options = sorted({row['content_category'] for row in details})
     selected_categories = left.multiselect('Content categories', category_options, default=category_options)
     operation_options = ['added', 'removed', 'modified']
     selected_operations = middle.multiselect('Operations', operation_options, default=operation_options)
     magnitude_options = ['Small', 'Medium', 'Large', 'Other', '(Not applicable)']
     selected_magnitudes = right.multiselect('Description sizes', magnitude_options, default=magnitude_options)
+    selected_overall_sizes = fourth.multiselect('Overall update sizes', size_order, default=size_order)
+    overall_by_event = {(row['snapshot_id'], row['record_id']): row for row in overall_updates}
     search = st.text_input('Search record, item, field, system type or owner', key='content_search').casefold()
     visible = [row for row in details if row['content_category'] in selected_categories
                and row['operation'] in selected_operations
                and (row['magnitude'] or '(Not applicable)') in selected_magnitudes
+               and overall_by_event[(row['snapshot_id'], row['record_id'])]['overall_update_size'] in selected_overall_sizes
                and search in ' '.join(str(row.get(key) or '') for key in
                    ('record_id', 'record_name', 'item', 'changed_fields', 'system_type', 'model_owner')).casefold()]
     columns = ['snapshot_id', 'observed_at', 'record_id', 'record_name', 'system_type', 'model_owner',
-               'content_category', 'item', 'operation', 'magnitude', 'word_edits', 'field_edits', 'changed_fields']
-    table([{key: row[key] for key in columns} for row in visible], 'content_change_details')
+               'overall_update_size', 'change_units', 'content_category', 'item', 'operation',
+               'magnitude', 'word_edits', 'field_edits', 'changed_fields']
+    visible_rows = []
+    for row in visible:
+        combined = overall_by_event[(row['snapshot_id'], row['record_id'])]
+        visible_rows.append({key: combined[key] if key in ('overall_update_size', 'change_units') else row[key]
+                             for key in columns})
+    table(visible_rows, 'content_change_details')
     if visible:
         selected = select_value('Inspect record event', range(len(visible)),
             lambda index: f"#{visible[index]['snapshot_id']} · {visible[index]['record_name']} · {visible[index]['content_category']} · {visible[index]['item']}",
@@ -510,7 +544,7 @@ def main():
     if local.exists():
         display = json.loads(local.read_text(encoding='utf-8'))
         for key in ('group_fields', 'type_fields', 'owner_fields', 'name_fields',
-                    'content_categories', 'description_edit_thresholds', 'array_keys'):
+                    'content_categories', 'description_edit_thresholds', 'combined_update_size', 'array_keys'):
             if key in display:
                 cfg[key] = display[key]
     cfg_json = json.dumps(cfg, sort_keys=True)
