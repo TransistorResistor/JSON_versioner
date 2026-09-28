@@ -83,7 +83,7 @@ History is stored in `json_history/history.sqlite3` beside the scripts. Each dis
 
 One Requests session is reused for each URL-list run, with connection pooling, normal certificate/hostname verification, and up to three retries for GET requests on connection failures and HTTP 429/500/502/503/504. Retry backoff and `Retry-After` are respected. `--timeout` is the read inactivity timeout; connection timeout is capped at 10 seconds. It is not a total time budget across the list or retries. Responses are streamed and limited to 20 MB **after** HTTP decompression.
 
-Use HTTPS in your URL list, prefix, and template. For an internal certificate authority, set `REQUESTS_CA_BUNDLE` to a trusted PEM CA bundle; certificate verification is never disabled by the CLI. This secures outgoing data requests; it does not configure TLS for the Streamlit dashboard server.
+Use HTTPS in your URL list, prefix, and template. For an internal certificate authority, prefer setting `REQUESTS_CA_BUNDLE` to a trusted PEM CA bundle. To accept a self-signed or otherwise untrusted certificate, pass `--insecure-skip-tls-verify`; this disables certificate and hostname verification for outgoing data requests and should only be used on networks you trust. This does not configure TLS for the Streamlit dashboard server.
 
 To diagnose a slow URL run without writing history, benchmark a random sample of ten records:
 

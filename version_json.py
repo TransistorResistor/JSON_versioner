@@ -322,8 +322,9 @@ class HTTPSession(requests.Session):
         return super().send(request, **kwargs)
 
 
-def https_session():
+def https_session(verify=True):
     session = HTTPSession()
+    session.verify = verify
     session.headers.update({'Accept': 'application/json', 'User-Agent': 'json-versioner/2.0'})
     retries = Retry(total=3, backoff_factor=.5, allowed_methods={'GET'},
                     status_forcelist=(429, 500, 502, 503, 504))
@@ -431,7 +432,7 @@ def benchmark_urls(args):
     with ExitStack() as resources:
         staged = StagedRecords()
         resources.callback(staged.close)
-        with https_session() as session:
+        with https_session(verify=not getattr(args, 'insecure_skip_tls_verify', False)) as session:
             _, errors = scan_urls(source, cfg, args.url_template, args.column, args.timeout,
                                   args.url_prefix, staged, session, sampled, timings)
     successful = [row for row in timings if 'error' not in row]
@@ -497,8 +498,9 @@ def snapshot(args, current, resources):
             raise ValueError('--url-template requires a .txt, .csv, .xlsx, or .json list')
         current, errors = scan(source, cfg, current)
     else:
-        current, errors = scan_urls(source, cfg, args.url_template, args.column, args.timeout,
-                                    getattr(args, 'url_prefix', None), current)
+        with https_session(verify=not getattr(args, 'insecure_skip_tls_verify', False)) as session:
+            current, errors = scan_urls(source, cfg, args.url_template, args.column, args.timeout,
+                                        getattr(args, 'url_prefix', None), current, session)
     if errors:
         print('\n'.join(errors[:20]), file=sys.stderr)
         if source.is_file() or cfg['invalid_json'] == 'abort':
@@ -589,6 +591,8 @@ def main():
     parser.add_argument('--url-prefix', help='Override config url_prefix for modelID entries')
     parser.add_argument('--column', help='CSV/Excel column or JSON object key; auto-detected by default')
     parser.add_argument('--timeout', type=float, default=20, help='Read inactivity timeout in seconds (default: 20); connect timeout capped at 10')
+    parser.add_argument('--insecure-skip-tls-verify', action='store_true',
+                        help='Accept self-signed/untrusted HTTPS certificates (insecure)')
     parser.add_argument('--benchmark', nargs='?', const=10, type=int, metavar='N',
                         help='Time a random read-only sample of N URL records (default: 10) without writing history')
     parser.add_argument('--list', action='store_true', help='Show snapshot history')
