@@ -84,7 +84,13 @@ def connect(path, cfg=None):
 
 def snapshots(path):
     with connect(path) as db:
-        return [dict(r) for r in db.execute('SELECT * FROM snapshots ORDER BY id')]
+        has_gaps = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='snapshot_gaps'").fetchone()
+        if has_gaps:
+            query = '''SELECT s.*,(SELECT COUNT(*) FROM snapshot_gaps g
+                WHERE g.snapshot_id=s.id) AS unavailable FROM snapshots s ORDER BY s.id'''
+        else:
+            query = 'SELECT s.*,0 AS unavailable FROM snapshots s ORDER BY s.id'
+        return [dict(r) for r in db.execute(query)]
 
 
 def period_data(path, cfg, start, end):

@@ -61,6 +61,41 @@ def normalize(value, cfg, path='$'):
     return value
 
 
+def source_owner(value, cfg, owner):
+    """Replace response owner fields with the owner supplied by the source list."""
+    if not isinstance(value, dict):
+        return value
+    fields = cfg.get('owner_fields', ['modelOwner'])
+    result = {key: child for key, child in value.items() if key not in fields}
+    if fields and owner is not None and str(owner).strip():
+        result[fields[0]] = str(owner).strip()
+    return result
+
+
+def unavailable_reason(value, cfg):
+    """Return the configured root-level unavailable phrase matched by a response."""
+    phrases = cfg.get('unavailable_phrases', [])
+    if isinstance(phrases, str):
+        phrases = [phrases]
+    wanted = {phrase.strip().casefold(): phrase.strip() for phrase in phrases
+              if isinstance(phrase, str) and phrase.strip()}
+    if not wanted:
+        return None
+    candidates = []
+    if isinstance(value, str):
+        candidates.append(value)
+    elif isinstance(value, list):
+        candidates.extend(item for item in value if isinstance(item, str))
+    elif isinstance(value, dict):
+        candidates.extend(value.keys())
+        candidates.extend(item for item in value.values() if isinstance(item, str))
+    for candidate in candidates:
+        matched = wanted.get(candidate.strip().casefold())
+        if matched:
+            return matched
+    return None
+
+
 def identity(data, filename, cfg):
     if isinstance(data, dict):
         for field in cfg['id_fields']:
@@ -199,7 +234,10 @@ def database(path):
         snapshot_id INTEGER, record_id TEXT, json_path TEXT, old_value TEXT, new_value TEXT,
         schema_only INTEGER, word_edits INTEGER, PRIMARY KEY(snapshot_id, record_id, json_path));
     CREATE INDEX IF NOT EXISTS ix_changes_record ON record_changes(record_id);
-    CREATE INDEX IF NOT EXISTS ix_fields_path ON field_changes(json_path);''')
+    CREATE INDEX IF NOT EXISTS ix_fields_path ON field_changes(json_path);
+    CREATE TABLE IF NOT EXISTS snapshot_gaps (
+        snapshot_id INTEGER, record_id TEXT, source TEXT, model_owner TEXT, reason TEXT NOT NULL,
+        PRIMARY KEY(snapshot_id, record_id));''')
     db.executescript('''CREATE TABLE IF NOT EXISTS record_blobs (
         hash TEXT PRIMARY KEY, payload BLOB NOT NULL, raw_bytes INTEGER NOT NULL,
         classification_json TEXT NOT NULL);
@@ -247,17 +285,28 @@ def selected_column(headers, column):
     raise ValueError(f'Cannot find a modelID, id, or url column; found {headers}')
 
 
+def owner_column(headers):
+    """Find an owner column without requiring a particular case or separator."""
+    return next((header for header in headers if 'owner' in str(header).casefold()), None)
+
+
 def source_entries(source: Path, column: str | None):
     """Read URLs/IDs from text, CSV, Excel, or a JSON array/object list."""
     suffix = source.suffix.lower()
     if suffix == '.txt':
-        values = [(str(i), line.strip()) for i, line in enumerate(source.read_text(encoding='utf-8-sig').splitlines(), 1)
-                  if line.strip() and not line.lstrip().startswith('#')]
+        values = []
+        for i, line in enumerate(source.read_text(encoding='utf-8-sig').splitlines(), 1):
+            if not line.strip() or line.lstrip().startswith('#'):
+                continue
+            parts = re.split(r'\s*[,\t]\s*|\s+', line.strip(), maxsplit=1)
+            values.append((str(i), parts[0], parts[1].strip() if len(parts) > 1 else None))
     elif suffix == '.csv':
         with source.open(newline='', encoding='utf-8-sig') as stream:
             reader = csv.DictReader(stream)
             field = selected_column(reader.fieldnames or [], column)
-            values = [(str(i), str(row.get(field) or '').strip()) for i, row in enumerate(reader, 2)
+            owner = owner_column(reader.fieldnames or [])
+            values = [(str(i), str(row.get(field) or '').strip(), str(row.get(owner) or '').strip() or None)
+                      for i, row in enumerate(reader, 2)
                       if str(row.get(field) or '').strip()]
     elif suffix == '.xlsx':
         try:
@@ -270,6 +319,8 @@ def source_entries(source: Path, column: str | None):
             rows = sheet.iter_rows(values_only=True)
             headers = [str(x).strip() if x is not None else '' for x in next(rows, ())]
             index = headers.index(selected_column(headers, column))
+            owner = owner_column(headers)
+            owner_index = headers.index(owner) if owner is not None else None
             values = []
             for number, row in enumerate(rows, 2):
                 raw = row[index] if index < len(row) else None
@@ -277,7 +328,9 @@ def source_entries(source: Path, column: str | None):
                     continue
                 if isinstance(raw, float) and raw.is_integer():
                     raw = int(raw)
-                values.append((str(number), str(raw).strip()))
+                owner_value = row[owner_index] if owner_index is not None and owner_index < len(row) else None
+                values.append((str(number), str(raw).strip(),
+                               str(owner_value).strip() if owner_value is not None and str(owner_value).strip() else None))
         finally:
             workbook.close()
     elif suffix == '.json':
@@ -293,20 +346,23 @@ def source_entries(source: Path, column: str | None):
         for number, item in enumerate(data, 1):
             if isinstance(item, dict):
                 field = selected_column(list(item), column)
+                owner = next((value for key, value in item.items() if 'owner' in str(key).casefold()), None)
                 item = item[field]
+            else:
+                owner = None
             if isinstance(item, bool) or not isinstance(item, (str, int, float)):
                 raise ValueError(f'JSON list item {number} must be a URL or modelID')
             if isinstance(item, float) and item.is_integer():
                 item = int(item)
             value = str(item).strip()
             if value:
-                values.append((str(number), value))
+                values.append((str(number), value, str(owner).strip() if owner is not None and str(owner).strip() else None))
     else:
         raise ValueError('List input must be .txt, .csv, .xlsx, or .json')
     if not values:
         raise ValueError('Source list has no entries')
     seen = set()
-    for line, value in values:
+    for line, value, owner in values:
         if value in seen:
             raise ValueError(f'Duplicate list entry {value!r} at row {line}')
         seen.add(value)
@@ -333,21 +389,21 @@ def https_session(verify=True):
 
 
 def scan_urls(source, cfg, template, column, timeout, prefix=None, result=None, session=None,
-              entries=None, timings=None):
+              entries=None, timings=None, gaps=None):
     if session is None:
         with https_session() as owned_session:
             return scan_urls(source, cfg, template, column, timeout, prefix, result, owned_session,
-                             entries, timings)
+                             entries, timings, gaps)
     entries = source_entries(source, column) if entries is None else entries
     result = {} if result is None else result
     errors = []
     if template and '{modelID}' not in template and '{id}' not in template:
         raise ValueError('URL template must contain {modelID} or {id}')
     prefix = cfg.get('url_prefix', '') if prefix is None else prefix
-    has_ids = any(urlparse(item).scheme not in ('http', 'https') for _, item in entries)
+    has_ids = any(urlparse(item).scheme not in ('http', 'https') for _, item, _ in entries)
     if has_ids and not template and not prefix:
         raise ValueError('ID list needs url_prefix in config.json, --url-prefix, or --url-template')
-    for number, (line, item) in enumerate(entries, 1):
+    for number, (line, item, owner) in enumerate(entries, 1):
         started = time.perf_counter()
         timing = {'row': line}
         supplied_url = urlparse(item).scheme in ('http', 'https')
@@ -380,6 +436,16 @@ def scan_urls(source, cfg, template, column, timeout, prefix=None, result=None, 
             body_at = time.perf_counter()
             raw = json.loads(payload.decode('utf-8-sig'))
             parsed_at = time.perf_counter()
+            unavailable = unavailable_reason(raw, cfg)
+            if unavailable:
+                record_id = (f'{cfg["id_fields"][0]}:{item}' if not supplied_url else f'file:{url}')
+                if gaps is not None:
+                    gaps.append((record_id, url, owner, unavailable))
+                if timings is not None:
+                    timing.update({'bytes': len(payload), 'unavailable': unavailable,
+                                   'total_seconds': time.perf_counter()-started})
+                    timings.append(timing)
+                continue
             if not isinstance(raw, dict):
                 raise ValueError('expected one JSON object per URL')
             rid = identity(raw, url, cfg)
@@ -391,7 +457,7 @@ def scan_urls(source, cfg, template, column, timeout, prefix=None, result=None, 
                     raise ValueError(f'returned ID {rid!r} does not match requested modelID {item!r}')
             if rid in result:
                 raise ValueError(f'duplicate record ID {rid} (also {result[rid][0]})')
-            value = normalize(raw, cfg)
+            value = source_owner(normalize(raw, cfg), cfg, owner)
             normalized_at = time.perf_counter()
             hash_ = digest(value)
             hashed_at = time.perf_counter()
@@ -493,6 +559,7 @@ def snapshot(args, current, resources):
     history = args.history.resolve()
     if source.is_dir() and (history == source or source in history.parents):
         raise ValueError('History must be outside the source directory')
+    gaps = []
     if source.is_dir():
         if args.url_template:
             raise ValueError('--url-template requires a .txt, .csv, .xlsx, or .json list')
@@ -500,7 +567,7 @@ def snapshot(args, current, resources):
     else:
         with https_session(verify=not getattr(args, 'insecure_skip_tls_verify', False)) as session:
             current, errors = scan_urls(source, cfg, args.url_template, args.column, args.timeout,
-                                        getattr(args, 'url_prefix', None), current, session)
+                                        getattr(args, 'url_prefix', None), current, session, gaps=gaps)
     if errors:
         print('\n'.join(errors[:20]), file=sys.stderr)
         if source.is_file() or cfg['invalid_json'] == 'abort':
@@ -523,6 +590,30 @@ def snapshot(args, current, resources):
         if any(old_cfg.get(k) != cfg.get(k) for k in comparison_keys):
             raise ValueError('Comparison settings changed; use a new --history directory for a new baseline')
     previous = PreviousRecords(db, previous_id)
+    previous_gaps = {}
+    if previous_id is not None:
+        previous_gaps = {row[0]: row[1:] for row in db.execute(
+            'SELECT record_id,source,model_owner,reason FROM snapshot_gaps WHERE snapshot_id=?',
+            (previous_id,))}
+    gap_map = {record_id: (source_url, owner, reason)
+               for record_id, source_url, owner, reason in gaps}
+    if source.is_file():
+        # An unavailable response may not contain its stable ID. Reconnect it
+        # to the latest record fetched from the same URL when possible.
+        for guessed_id, details in list(gap_map.items()):
+            prior = db.execute('''SELECT r.record_id FROM records r
+                WHERE r.filename=? ORDER BY r.snapshot_id DESC LIMIT 1''', (details[0],)).fetchone()
+            if prior and prior[0] != guessed_id:
+                gap_map.pop(guessed_id)
+                gap_map[prior[0]] = details
+        # Carry gaps forward, including entries that simply disappeared from
+        # the latest URL list, without converting them into removals.
+        for rid in previous.keys() - current.keys():
+            gap_map.setdefault(rid, (previous.metadata[rid][0], None, 'missing from capture'))
+        for rid, details in previous_gaps.items():
+            if rid not in current:
+                gap_map.setdefault(rid, details)
+    gaps = [(record_id, *details) for record_id, details in gap_map.items()]
     common = current.keys() & previous.keys()
     pending = (changes(previous[rid][1], current[rid][1], cfg) for rid in common
                if current.hashes[rid] != previous.metadata[rid][1])
@@ -534,15 +625,32 @@ def snapshot(args, current, resources):
         cur = db.execute('INSERT INTO snapshots(created_at,previous_id,source,note,config_json) VALUES(?,?,?,?,?)',
                          (timestamp, previous_id, str(source), args.note, canonical(cfg)))
         sid = cur.lastrowid
+        db.executemany('INSERT INTO snapshot_gaps VALUES(?,?,?,?,?)',
+                       ((sid, record_id, source_url, owner, reason)
+                        for record_id, source_url, owner, reason in gaps))
         for rid, hash_ in current.hashes.items():
             if not db.execute('SELECT 1 FROM record_blobs WHERE hash=?', (hash_,)).fetchone():
                 put_blob(db, hash_, canonical(current[rid][1]), cfg)
             db.execute('INSERT INTO records VALUES(?,?,?,?,NULL)', (sid, rid, current.filenames[rid], hash_))
-        for rid in sorted(current.keys() | previous.keys()):
+        for rid in sorted(current.keys() | previous.keys() | gap_map.keys()):
+            if rid in gap_map:
+                continue
             if rid in current and rid in previous.metadata and previous.metadata[rid] == (current.filenames[rid], current.hashes[rid]):
                 counts['unchanged'] += 1
                 continue
             old, new = previous.get(rid), current.get(rid)
+            comparison_time = previous_time
+            if old is None and new is not None and rid in previous_gaps:
+                last_seen = db.execute('''SELECT r.snapshot_id,s.created_at FROM records r
+                    JOIN snapshots s ON s.id=r.snapshot_id
+                    WHERE r.record_id=? AND r.snapshot_id<? ORDER BY r.snapshot_id DESC LIMIT 1''',
+                    (rid, sid)).fetchone()
+                if last_seen:
+                    old = PreviousRecords(db, last_seen[0]).get(rid)
+                    comparison_time = parse_update(last_seen[1])
+                    if old and old[0] == new[0] and old[2] == new[2]:
+                        counts['unchanged'] += 1
+                        continue
             if old is None:
                 kind, diff = 'added', []
             elif new is None:
@@ -561,7 +669,7 @@ def snapshot(args, current, resources):
                                  sum(weight(p, cfg) for p, _ in leaves(new[1])) if new else 0, 1)
             score = sum(weight(p, cfg) for p, _, _ in meaningful)
             reported = new[3] if new and kind == 'modified' else None
-            event_at, event_basis = change_time(kind, reported, previous_time, now)
+            event_at, event_basis = change_time(kind, reported, comparison_time, now)
             db.execute('''INSERT INTO record_changes
                 (snapshot_id,record_id,filename,previous_filename,change_type,fields_changed,
                  fields_total,change_ratio,weighted_ratio,event_at,event_basis,reported_updated_at)
@@ -577,7 +685,8 @@ def snapshot(args, current, resources):
         db.execute('UPDATE snapshots SET total=?,added=?,removed=?,modified=?,unchanged=?,schema_only=? WHERE id=?',
                    (len(current), counts['added'], counts['removed'], counts['modified'], counts['unchanged'], counts['schema_only'], sid))
     print(f'Snapshot {sid}: {len(current)} records; {counts["added"]} added, {counts["removed"]} removed, '
-          f'{counts["modified"]} modified, {counts["unchanged"]} unchanged, {counts["schema_only"]} schema-only')
+          f'{counts["modified"]} modified, {counts["unchanged"]} unchanged, {counts["schema_only"]} schema-only, '
+          f'{len(gaps)} unavailable')
 
 
 def main():

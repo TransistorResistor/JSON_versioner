@@ -5,6 +5,7 @@
   "owner_fields": ["modelOwner"],
   "name_fields": ["nomenclature", "name"],
   "url_prefix": "",
+  "unavailable_phrases": [],
   "updated_at_fields": ["updated_at", "updatedDate"],
   "ignore_fields": ["export_timestamp", "_comment"],
   "ignore_paths": ["$.parametrics[].parameterDescr"],

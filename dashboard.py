@@ -497,8 +497,8 @@ def storage_health(path, snapshots):
         hours = (pd.Timestamp(current['created_at'])-pd.Timestamp(previous['created_at'])).total_seconds()/3600
         gaps.append({'snapshot': current['id'], 'observed_at': current['created_at'], 'hours_since_previous': round(hours, 2)})
     chart(gaps, 'bar', alt.X('observed_at:T', title='Observation (UTC)'), alt.Y('hours_since_previous:Q', title='Hours since previous observation'))
-    st.caption('Gaps show collection cadence, not confirmed outages. Failed collection attempts and historical file-size samples are not stored, so this page does not infer them.')
-    table([{k: r[k] for k in ['id', 'created_at', 'note', 'total', 'added', 'removed', 'modified', 'schema_only']} for r in snapshots], 'observations')
+    st.caption('Cadence gaps show time between captures, not confirmed outages. The Unavailable column counts list entries whose root response matched a configured unavailable phrase; other failed collection attempts are not stored.')
+    table([{k: r[k] for k in ['id', 'created_at', 'note', 'total', 'unavailable', 'added', 'removed', 'modified', 'schema_only']} for r in snapshots], 'observations')
     with st.expander('Legacy storage maintenance'):
         st.code('python version_json.py --compact-storage', language='powershell')
         st.write('Run from the terminal with writers stopped and this dashboard closed. The command creates a backup before conversion and compaction.')
