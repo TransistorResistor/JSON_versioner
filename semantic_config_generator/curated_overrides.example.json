@@ -1,0 +1,13 @@
+{
+  "profile": "executive",
+  "notes": "Example only. Copy deliberate entries into the generated curated_overrides.json.",
+  "fields": {
+    "$.modelOwner": {
+      "label": "Accountable owner",
+      "importance": "review"
+    },
+    "$.parametrics[].parameterDescr": {
+      "importance": "hidden"
+    }
+  }
+}

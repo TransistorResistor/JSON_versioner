@@ -17,6 +17,8 @@ mockups/qa/
 
 # Local-only tests, benchmarks, mockups, and browser QA
 test_*.py
+!semantic_config_generator/test_generate_config.py
+!executive_dashboard/test_data.py
 benchmark_*.py
 verify_dashboard_ui.py
 mockups/
