@@ -13,6 +13,7 @@ import pandas as pd
 import streamlit as st
 
 import dashboard_data as data
+from configuration import configuration
 
 ROOT = Path(__file__).resolve().parent
 VIEW_OVERVIEW = 'Where changes are happening'
@@ -325,7 +326,7 @@ def content_changes_view(path, stamp, cfg, snapshots, events, include_baseline):
             key='content_detail_'+fingerprint([(row['snapshot_id'], row['record_id'], row['item_path']) for row in visible]))
         row = visible[selected]
         event = next(item for item in modified if item['snapshot_id'] == row['snapshot_id'] and item['record_id'] == row['record_id'])
-        record_detail(path, stamp, cfg, snapshots, row['record_id'], event['previous_id'], event['snapshot_id'])
+        record_detail(path, stamp, cfg, snapshots, row['record_id'], event['comparison_snapshot_id'], event['snapshot_id'])
 
 
 def timing_scope(path, stamp, cfg_json, events, include_baseline):
@@ -459,7 +460,7 @@ def explorer(path, stamp, cfg, snapshots, period, events, filters, include_basel
             selected_event = page_rows[index]
         st.download_button('Download filtered events CSV', pd.DataFrame(rows).to_csv(index=False).encode('utf-8-sig'),
                            'filtered_events.csv', 'text/csv')
-        rid, previous_id, sid = selected_event['record_id'], selected_event['previous_id'], selected_event['snapshot_id']
+        rid, previous_id, sid = selected_event['record_id'], selected_event['comparison_snapshot_id'], selected_event['snapshot_id']
     else:
         by_id = {r['id']: r for r in period}
         sid = select_value('Observation', list(by_id),
@@ -547,6 +548,7 @@ def main():
                     'content_categories', 'description_edit_thresholds', 'combined_update_size', 'array_keys'):
             if key in display:
                 cfg[key] = display[key]
+    cfg = configuration(cfg)
     cfg_json = json.dumps(cfg, sort_keys=True)
     stamp = database_stamp(path)
     with st.spinner('Loading category history…'):

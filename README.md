@@ -112,7 +112,7 @@ At 10,000 records of 10–250 KB, the old layout repeated roughly 100 MB–2.5 G
 
 Incoming records are staged on temporary disk, and previous payloads are read only when needed. RAM no longer needs to hold both complete datasets. Allow temporary space for a compressed incoming dataset; unusually large individual records and their diffs still need memory. The dashboard reads stored classification metadata instead of decompressing payloads for the usual filters, defaults to 30 snapshots, exposes storage statistics, and provides an ID search before selecting among large change histories. Changing classification field names may require reading payloads again.
 
-The development workspace used `python -m unittest -v` for regression checks and synthetic benchmark scripts; those local test and mock files are intentionally excluded from the distribution. See [REVIEW.md](REVIEW.md) for findings and remaining tradeoffs.
+Run the complete regression suite from the repository root with `python -m unittest discover -v`. Core capture/storage tests, both dashboard suites, and semantic-generator tests are included in the repository. Tests use temporary histories and mocked network requests. Local benchmark and browser QA scripts remain excluded. See [REVIEW.md](REVIEW.md) for findings and remaining tradeoffs.
 
 ## Comparison rules
 
@@ -124,7 +124,9 @@ The default array identities now use composite keys for Parameters, Relationship
 
 ## Configuration reference
 
-The default [config.json](config.json) is created if missing. Use `--config path\to\other.json` to snapshot with a different file. The dashboard uses its stored snapshot settings plus the `config.json` beside the scripts for current display settings.
+The user configuration [config.json](config.json) is created if missing from the independent [default_config.json](default_config.json). Use `--config path\to\other.json` to snapshot with a different file. Omitted top-level settings inherit defaults; explicitly supplied lists and objects replace the corresponding defaults, including empty lists. Capture and dashboards validate configuration types, array keys, weights, categories, and threshold ordering. The dashboard uses its stored snapshot settings plus the `config.json` beside the scripts for current display settings.
+
+New record events store their actual comparison snapshot separately from the observation's predecessor. After a URL capture gap, before/after details and category transfers use the last seen version. Dashboard readers infer this comparison for older gap histories without modifying them; the next capture adds the new column automatically.
 
 | Setting | Use |
 | --- | --- |

@@ -5,7 +5,7 @@ import unittest
 import zlib
 from pathlib import Path
 
-import generate_config as generator
+from semantic_config_generator import generate_config as generator
 
 
 class GeneratorTests(unittest.TestCase):

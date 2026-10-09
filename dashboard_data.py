@@ -10,22 +10,16 @@ from collections import Counter, defaultdict
 from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
-from urllib.parse import unquote
 
 import pandas as pd
 
 from storage import dashboard_records, record_text
+from comparison import COMPARISON_KEYS, MISSING, canonical, changes, selector_values
+from configuration import DEFAULT_CONTENT_CATEGORIES, content_categories
 
 UNKNOWN = '(Unspecified)'
 DIMENSIONS = {'System type': 'system_type', 'System group': 'system_group', 'Model owner': 'model_owner'}
 MEANINGFUL = ('added', 'removed', 'modified')
-DEFAULT_CONTENT_CATEGORIES = [
-    {'key': 'descriptions', 'label': 'Descriptions', 'paths': ['$.descriptions[]']},
-    {'key': 'parameters', 'label': 'Parameters', 'paths': ['$.parametrics[]']},
-    {'key': 'relationships', 'label': 'Relationships', 'paths': ['$.relations[]']},
-    {'key': 'media', 'label': 'Media', 'paths': ['$.media[]']},
-    {'key': 'metadata', 'label': 'Metadata', 'fallback': True},
-]
 DEFAULT_COMBINED_UPDATE_SIZE = {'small_max': 4, 'medium_max': 15}
 
 
@@ -66,8 +60,20 @@ def connect(path, cfg=None):
             columns = {r[1] for r in db.execute('PRAGMA table_info(record_changes)')}
             event_at = 'COALESCE(rc.event_at,s.created_at)' if 'event_at' in columns else 's.created_at'
             basis = "COALESCE(rc.event_basis,'snapshot observation (legacy)')" if 'event_basis' in columns else "'snapshot observation (legacy)'"
+            has_gaps = db.execute("SELECT 1 FROM sqlite_master WHERE name='snapshot_gaps'").fetchone()
+            comparison_id = 's.previous_id'
+            if has_gaps:
+                comparison_id = '''CASE WHEN EXISTS(SELECT 1 FROM snapshot_gaps g
+                    WHERE g.snapshot_id=s.previous_id AND g.record_id=rc.record_id)
+                    THEN (SELECT MAX(pr.snapshot_id) FROM records pr
+                        WHERE pr.record_id=rc.record_id AND pr.snapshot_id<rc.snapshot_id)
+                    ELSE s.previous_id END'''
+            if 'comparison_snapshot_id' in columns:
+                comparison_id = f'COALESCE(rc.comparison_snapshot_id, {comparison_id})'
+            rc_fields = ','.join(f'rc.{name}' for name in sorted(columns) if name != 'comparison_snapshot_id')
             fields = ','.join(f"COALESCE(r.{name},old.{name},{repr(UNKNOWN)}) AS {name},old.{name} AS previous_{name}" for name in field_sets)
-            db.execute(f'''CREATE TEMP VIEW events AS SELECT rc.*,s.created_at,s.previous_id,
+            db.execute(f'''CREATE TEMP VIEW events AS SELECT {rc_fields},s.created_at,s.previous_id,
+                {comparison_id} AS comparison_snapshot_id,
                 {event_at} AS estimated_at,{basis} AS timing_basis,
                 {fields},
                 CASE WHEN rc.change_type!='unchanged' THEN rc.change_type
@@ -76,7 +82,7 @@ def connect(path, cfg=None):
                      ELSE 'source moved' END AS kind
                 FROM record_changes rc JOIN snapshots s ON s.id=rc.snapshot_id
                 LEFT JOIN dimensions r ON r.snapshot_id=rc.snapshot_id AND r.record_id=rc.record_id
-                LEFT JOIN dimensions old ON old.snapshot_id=s.previous_id AND old.record_id=rc.record_id''')
+                LEFT JOIN dimensions old ON old.snapshot_id=({comparison_id}) AND old.record_id=rc.record_id''')
         yield db
     finally:
         db.close()
@@ -200,33 +206,6 @@ def field_scope(path, cfg, event_keys):
                    for field, s in stats.items()], key=lambda r: (-r['unique_records'], r['field']))
 
 
-def content_categories(cfg):
-    categories = cfg.get('content_categories', DEFAULT_CONTENT_CATEGORIES)
-    if not isinstance(categories, list) or not categories:
-        raise ValueError('content_categories must be a non-empty list')
-    result = []
-    seen = set()
-    fallback = None
-    for category in categories:
-        key, label = category.get('key'), category.get('label')
-        if not isinstance(key, str) or not key or key in seen or not isinstance(label, str) or not label:
-            raise ValueError('Each content category needs a unique non-empty key and label')
-        seen.add(key)
-        paths = category.get('paths', [])
-        if not isinstance(paths, list) or not all(isinstance(item, str) and item.startswith('$.') for item in paths):
-            raise ValueError(f'Content category {key!r} has invalid paths')
-        item = {'key': key, 'label': label, 'paths': paths, 'fallback': bool(category.get('fallback'))}
-        if item['fallback']:
-            if fallback is not None:
-                raise ValueError('Only one content category may be the fallback')
-            fallback = item
-        else:
-            result.append(item)
-    if fallback is None:
-        fallback = {'key': 'other', 'label': 'Other', 'paths': [], 'fallback': True}
-    return result + [fallback]
-
-
 def content_category(json_path, categories):
     normalized = re.sub(r'\[[^]]*\]', '[]', json_path)
     for category in categories:
@@ -255,19 +234,10 @@ def content_item_label(item_path):
     raw = item_path[bracket+1:-1]
     if raw.isdigit():
         return f'Item {int(raw)+1}'
-    values = []
-    for part in raw.split(','):
-        if '=' not in part:
-            continue
-        field, encoded = part.split('=', 1)
-        decoded = unquote(encoded)
-        try:
-            value = json.loads(decoded)
-        except json.JSONDecodeError:
-            value = decoded
-        if value not in (None, ''):
-            values.append(f'{field}: {value}' if len(raw.split(',')) > 1 else str(value))
-    return ' · '.join(values) or raw
+    values = selector_values(raw)
+    labels = [f'{field}: {value}' if len(values) > 1 else str(value)
+              for field, value in values.items() if value not in (None, '')]
+    return ' · '.join(labels) or raw
 
 
 def content_change_details(path, cfg, events):
@@ -439,6 +409,20 @@ def record_version(path, snapshot_id, record_id):
         return json.loads(record_text(db, row['hash'], row['json_text'])) if row else ABSENT
 
 
+def event_versions(path, event):
+    """Use the actual comparison predecessor, including legacy gap histories."""
+    sid = event.get('comparison_snapshot_id', event.get('previous_id'))
+    if 'comparison_snapshot_id' not in event:
+        with connect(path) as db:
+            has_gaps = db.execute("SELECT 1 FROM sqlite_master WHERE name='snapshot_gaps'").fetchone()
+            if has_gaps and db.execute('SELECT 1 FROM snapshot_gaps WHERE snapshot_id=? AND record_id=?',
+                                      (sid, event['record_id'])).fetchone():
+                sid = db.execute('SELECT MAX(snapshot_id) FROM records WHERE snapshot_id<? AND record_id=?',
+                                 (event['snapshot_id'], event['record_id'])).fetchone()[0]
+    return (record_version(path, sid, event['record_id']),
+            record_version(path, event['snapshot_id'], event['record_id']))
+
+
 def record_timeline(path, cfg, record_id):
     with connect(path, cfg) as db:
         return [dict(r) for r in db.execute('''SELECT s.id AS snapshot_id,s.created_at,s.note,
@@ -452,15 +436,13 @@ def record_timeline(path, cfg, record_id):
 
 def comparison(path, record_id, before_id, after_id):
     """Compare actual endpoint versions, preserving missing vs JSON null."""
-    from version_json import MISSING, canonical, changes
     with connect(path) as db:
         settings = {}
         for sid in (before_id, after_id):
             row = db.execute('SELECT config_json FROM snapshots WHERE id=?', (sid,)).fetchone() if sid else None
             settings[sid] = json.loads(row[0]) if row else {}
         a_cfg, b_cfg = settings[before_id], settings[after_id]
-        keys = ('id_fields', 'ignore_fields', 'ignore_paths', 'updated_at_fields', 'unordered_arrays', 'array_keys')
-        compatible = not before_id or all(a_cfg.get(k) == b_cfg.get(k) for k in keys)
+        compatible = not before_id or all(a_cfg.get(k) == b_cfg.get(k) for k in COMPARISON_KEYS)
     before = record_version(path, before_id, record_id)
     after = record_version(path, after_id, record_id)
     result = []

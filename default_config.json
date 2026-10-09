@@ -1,0 +1,124 @@
+{
+  "id_fields": [
+    "modelID",
+    "id",
+    "record_id"
+  ],
+  "group_fields": [
+    "systemGroup"
+  ],
+  "type_fields": [
+    "systemType"
+  ],
+  "owner_fields": [
+    "modelOwner"
+  ],
+  "name_fields": [
+    "nomenclature",
+    "name"
+  ],
+  "url_prefix": "",
+  "unavailable_phrases": [],
+  "updated_at_fields": [
+    "updated_at",
+    "updatedDate"
+  ],
+  "ignore_fields": [
+    "export_timestamp",
+    "_comment"
+  ],
+  "ignore_paths": [
+    "$.parametrics[].parameterDescr"
+  ],
+  "dashboard_display": {
+    "exclude_parameter_fields": [
+      "parameterDescr",
+      "parameterOnly",
+      "seq",
+      "dataType",
+      "parameter",
+      "component"
+    ],
+    "exclude_description_fields": [],
+    "exclude_other_paths": []
+  },
+  "unordered_arrays": [
+    "$.tags",
+    "$.categories"
+  ],
+  "array_keys": {
+    "$.descriptions": "descrType",
+    "$.parametrics": [
+      "component",
+      "parameter"
+    ],
+    "$.relations": [
+      "childModelID",
+      "relationType",
+      "parentComponent"
+    ],
+    "$.proliferations": [
+      "country",
+      "proliferation",
+      "organization"
+    ],
+    "$.aliases": "alias",
+    "$.codes": "code",
+    "$.media": "mediaID"
+  },
+  "content_categories": [
+    {
+      "key": "descriptions",
+      "label": "Descriptions",
+      "paths": [
+        "$.descriptions[]"
+      ]
+    },
+    {
+      "key": "parameters",
+      "label": "Parameters",
+      "paths": [
+        "$.parametrics[]"
+      ]
+    },
+    {
+      "key": "relationships",
+      "label": "Relationships",
+      "paths": [
+        "$.relations[]"
+      ]
+    },
+    {
+      "key": "media",
+      "label": "Media",
+      "paths": [
+        "$.media[]"
+      ]
+    },
+    {
+      "key": "metadata",
+      "label": "Metadata",
+      "fallback": true
+    }
+  ],
+  "description_edit_thresholds": {
+    "small": 50,
+    "medium": 250
+  },
+  "combined_update_size": {
+    "small_max": 4,
+    "medium_max": 15
+  },
+  "important_fields": {
+    "$.status": 3,
+    "$.owner": 2,
+    "$.classification": 3
+  },
+  "change_thresholds": {
+    "tiny": 0.02,
+    "small": 0.1,
+    "medium": 0.4
+  },
+  "schema_field_fraction": 0.9,
+  "invalid_json": "abort"
+}

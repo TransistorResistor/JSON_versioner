@@ -5,8 +5,6 @@ import argparse
 import collections
 import csv
 import datetime as dt
-import difflib
-import hashlib
 import json
 import random
 import re
@@ -21,44 +19,18 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from configuration import load_config
+from comparison import (
+    COMPARISON_KEYS, MISSING, canonical, digest, path_matches, normalize,
+    leaves, count_fields, word_edits, array_key_fields, array_identity, array_path, changes,
+)
 from storage import StagedRecords, PreviousRecords, put_blob, compact_storage
 
 ROOT = Path(__file__).resolve().parent
-MISSING = object()
 
 
 def config(path: Path) -> dict:
-    default = json.loads((ROOT / 'config.json').read_text(encoding='utf-8'))
-    if not path.exists():
-        path.write_text(json.dumps(default, indent=2) + '\n', encoding='utf-8')
-        print(f'Created {path}')
-    return {**default, **json.loads(path.read_text(encoding='utf-8'))}
-
-
-def canonical(value):
-    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(',', ':'))
-
-
-def digest(value):
-    return hashlib.sha256(canonical(value).encode('utf-8')).hexdigest()
-
-
-def path_matches(path: str, patterns: list[str]) -> bool:
-    normalized = re.sub(r'\[[^]]*\]', '[]', path)
-    return path in patterns or normalized in patterns
-
-
-def normalize(value, cfg, path='$'):
-    if isinstance(value, dict):
-        return {k: normalize(v, cfg, f'{path}.{k}') for k, v in value.items()
-                if k not in cfg['ignore_fields'] and not (path == '$' and k in cfg.get('updated_at_fields', []))
-                and not path_matches(f'{path}.{k}', cfg['ignore_paths'])}
-    if isinstance(value, list):
-        result = [normalize(v, cfg, f'{path}[]') for v in value]
-        if path_matches(path, cfg['unordered_arrays']):
-            result.sort(key=canonical)
-        return result
-    return value
+    return load_config(path, create=True)
 
 
 def source_owner(value, cfg, owner):
@@ -141,81 +113,6 @@ def change_time(kind, reported, previous_time, snapshot_time):
     return snapshot_time.isoformat(timespec='seconds'), 'snapshot observation'
 
 
-def leaves(value, path='$'):
-    if isinstance(value, (dict, list)) and not value:
-        yield path, value
-    elif isinstance(value, dict):
-        for key, child in value.items():
-            yield from leaves(child, f'{path}.{key}')
-    elif isinstance(value, list):
-        for i, child in enumerate(value):
-            yield from leaves(child, f'{path}[{i}]')
-    else:
-        yield path, value
-
-
-def count_fields(value):
-    return max(1, sum(1 for _ in leaves(value)))
-
-
-def word_edits(old, new):
-    a, b = re.findall(r"\b[\w'-]+\b", old), re.findall(r"\b[\w'-]+\b", new)
-    return sum(max(i2-i1, j2-j1) for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b).get_opcodes() if tag != 'equal')
-
-
-def array_key_fields(spec):
-    """Return a validated list of fields from a string or composite key spec."""
-    fields = [spec] if isinstance(spec, str) else spec
-    if not isinstance(fields, list) or not fields or not all(isinstance(field, str) and field for field in fields):
-        raise ValueError(f'array_keys values must be a field name or non-empty field-name list; got {spec!r}')
-    return fields
-
-
-def array_identity(item, fields):
-    return tuple(canonical(item[field]) for field in fields)
-
-
-def array_path(path, fields, identity):
-    # Percent encoding keeps brackets and commas in source values from making
-    # the human-readable JSON path ambiguous.
-    parts = [f'{field}={quote(value, safe="")}' for field, value in zip(fields, identity)]
-    return f'{path}[{",".join(parts)}]'
-
-
-def changes(old, new, cfg, path='$'):
-    if old is not MISSING and new is not MISSING and canonical(old) == canonical(new):
-        return
-    if isinstance(old, dict) and isinstance(new, dict):
-        for key in sorted(old.keys() | new.keys()):
-            yield from changes(old.get(key, MISSING), new.get(key, MISSING), cfg, f'{path}.{key}')
-    elif isinstance(old, list) and isinstance(new, list):
-        key_spec = cfg.get('array_keys', {}).get(path)
-        if key_spec:
-            keys = array_key_fields(key_spec)
-        else:
-            keys = []
-        if keys and all(isinstance(x, dict) and all(key in x for key in keys) for x in old + new):
-            a = {array_identity(x, keys): x for x in old}
-            b = {array_identity(x, keys): x for x in new}
-            if len(a) == len(old) and len(b) == len(new):
-                for name in sorted(a.keys() | b.keys()):
-                    yield from changes(a.get(name, MISSING), b.get(name, MISSING), cfg, array_path(path, keys, name))
-                return
-        for i in range(max(len(old), len(new))):
-            yield from changes(old[i] if i < len(old) else MISSING,
-                               new[i] if i < len(new) else MISSING, cfg, f'{path}[{i}]')
-    else:
-        # An object/array addition is expanded so new schema fields can be recognised.
-        if old is MISSING and isinstance(new, (dict, list)):
-            for leaf, val in leaves(new, path):
-                yield leaf, MISSING, val
-        elif new is MISSING and isinstance(old, (dict, list)):
-            for leaf, val in leaves(old, path):
-                yield leaf, val, MISSING
-        else:
-            yield path, old, new
-
-
 def database(path):
     db = sqlite3.connect(path)
     db.execute('PRAGMA foreign_keys=ON')
@@ -242,11 +139,14 @@ def database(path):
         hash TEXT PRIMARY KEY, payload BLOB NOT NULL, raw_bytes INTEGER NOT NULL,
         classification_json TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS ix_fields_record ON field_changes(record_id, snapshot_id);
+    CREATE INDEX IF NOT EXISTS ix_records_record ON records(record_id, snapshot_id);
     CREATE INDEX IF NOT EXISTS ix_records_hash ON records(hash);''')
     columns = {row[1] for row in db.execute('PRAGMA table_info(record_changes)')}
     for name in ('event_at', 'event_basis', 'reported_updated_at'):
         if name not in columns:
             db.execute(f'ALTER TABLE record_changes ADD COLUMN {name} TEXT')
+    if 'comparison_snapshot_id' not in columns:
+        db.execute('ALTER TABLE record_changes ADD COLUMN comparison_snapshot_id INTEGER')
     db.execute('''UPDATE record_changes SET event_at=(SELECT created_at FROM snapshots
         WHERE snapshots.id=record_changes.snapshot_id), event_basis='snapshot observation (legacy)'
         WHERE event_at IS NULL AND change_type IN ('added','removed','modified')''')
@@ -585,9 +485,8 @@ def snapshot(args, current, resources):
     previous_id = previous_row[0] if previous_row else None
     previous_time = parse_update(previous_row[1]) if previous_row else None
     if previous_row:
-        comparison_keys = ('id_fields', 'ignore_fields', 'ignore_paths', 'updated_at_fields', 'unordered_arrays', 'array_keys')
         old_cfg = json.loads(previous_row[2])
-        if any(old_cfg.get(k) != cfg.get(k) for k in comparison_keys):
+        if any(old_cfg.get(k) != cfg.get(k) for k in COMPARISON_KEYS):
             raise ValueError('Comparison settings changed; use a new --history directory for a new baseline')
     previous = PreviousRecords(db, previous_id)
     previous_gaps = {}
@@ -640,6 +539,7 @@ def snapshot(args, current, resources):
                 continue
             old, new = previous.get(rid), current.get(rid)
             comparison_time = previous_time
+            comparison_snapshot_id = previous_id
             if old is None and new is not None and rid in previous_gaps:
                 last_seen = db.execute('''SELECT r.snapshot_id,s.created_at FROM records r
                     JOIN snapshots s ON s.id=r.snapshot_id
@@ -648,6 +548,7 @@ def snapshot(args, current, resources):
                 if last_seen:
                     old = PreviousRecords(db, last_seen[0]).get(rid)
                     comparison_time = parse_update(last_seen[1])
+                    comparison_snapshot_id = last_seen[0]
                     if old and old[0] == new[0] and old[2] == new[2]:
                         counts['unchanged'] += 1
                         continue
@@ -672,11 +573,11 @@ def snapshot(args, current, resources):
             event_at, event_basis = change_time(kind, reported, comparison_time, now)
             db.execute('''INSERT INTO record_changes
                 (snapshot_id,record_id,filename,previous_filename,change_type,fields_changed,
-                 fields_total,change_ratio,weighted_ratio,event_at,event_basis,reported_updated_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
+                 fields_total,change_ratio,weighted_ratio,event_at,event_basis,reported_updated_at,comparison_snapshot_id)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                        (sid, rid, new[0] if new else old[0], old[0] if old else None,
                         kind, len(meaningful), total, min(len(meaningful)/total, 1), min(score/weighted_total, 1),
-                        event_at, event_basis, reported))
+                        event_at, event_basis, reported, comparison_snapshot_id if old else None))
             for path, a, b in diff:
                 words = word_edits('' if a is MISSING else a, '' if b is MISSING else b) if (a is MISSING or isinstance(a, str)) and (b is MISSING or isinstance(b, str)) and re.search(r'description', path, re.I) else None
                 db.execute('INSERT INTO field_changes VALUES(?,?,?,?,?,?,?)',

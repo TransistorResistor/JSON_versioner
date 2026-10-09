@@ -9,6 +9,11 @@
   "updated_at_fields": ["updated_at", "updatedDate"],
   "ignore_fields": ["export_timestamp", "_comment"],
   "ignore_paths": ["$.parametrics[].parameterDescr"],
+  "dashboard_display": {
+    "exclude_parameter_fields": ["parameterDescr", "parameterOnly", "seq", "dataType"],
+    "exclude_description_fields": [],
+    "exclude_other_paths": []
+  },
   "unordered_arrays": ["$.tags", "$.categories"],
   "array_keys": {
     "$.descriptions": "descrType",

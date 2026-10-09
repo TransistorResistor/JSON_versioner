@@ -15,13 +15,39 @@ venv/
 .env.*
 mockups/qa/
 
-# Local-only tests, benchmarks, mockups, and browser QA
-test_*.py
-!semantic_config_generator/test_generate_config.py
-!executive_dashboard/test_data.py
+# Local-only benchmarks, mockups, and browser QA; regression tests are included
 benchmark_*.py
 verify_dashboard_ui.py
 mockups/
 
 # Local maintenance backups
 *.pre-compression.bak
+
+# Temporary files, logs, scratch text, and editor/OS artifacts
+temp/
+tmp/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.matplotlib/
+.coverage
+htmlcov/
+*.tmp
+*.temp
+*.log
+*.bak
+*.swp
+*.swo
+*~
+*.txt
+!requirements.txt
+!requirements-*.txt
+!CMakeLists.txt
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Rebuildable synthetic dashboard data
+executive_dashboard/demo/generated/
+executive_dashboard/demo/generated_*/
+executive_dashboard/demo/synthetic-build-*/
