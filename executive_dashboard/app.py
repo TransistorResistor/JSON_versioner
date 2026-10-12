@@ -24,8 +24,16 @@ st.set_page_config(page_title='Change Brief', page_icon='∆', layout='wide')
 @st.cache_data(show_spinner=False, max_entries=4)
 def load(path, stamp, cfg_json, start_snapshot, end_snapshot):
     cfg = configuration(json.loads(cfg_json))
-    snapshots, totals, events = data.load_history(path, cfg, start_snapshot, end_snapshot)
-    return cfg, snapshots, totals, events
+    snapshots, totals, events = data.load_history(path, cfg, start_snapshot, end_snapshot, include_totals=False)
+    rows = data.change_rows(events, cfg)
+    dates = {}
+    for event in events:
+        key = (event.get('estimated_at'), event['created_at'])
+        if key not in dates:
+            dates[key] = data.estimated_day(event).date()
+    days = list(dates.values()) + [pd.to_datetime(item['created_at'], utc=True).date()
+                                 for item in snapshots if start_snapshot <= item['id'] <= end_snapshot]
+    return cfg, snapshots, rows, min(days), max(days)
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
@@ -38,9 +46,26 @@ def load_filter_inventory(path, stamp, cfg_json, start, end):
     return data.filter_inventory(path, configuration(json.loads(cfg_json)), start, end)
 
 
+@st.cache_data(show_spinner=False, max_entries=4)
+def load_filtered_rows(path, stamp, cfg_json, first, last, filters_json, start, end, last_capture):
+    # Cache identity is small and includes every source/selection input. Do not
+    # serialize thousands of event dictionaries on every Streamlit rerun.
+    cfg, _, rows, _, _ = load(path, stamp, cfg_json, first, last)
+    filters = json.loads(filters_json)
+    if last_capture:
+        rows = [row for row in rows if row['snapshot_id'] == last]
+    selected = data.filter_changes(rows, filters['system_group'], filters['system_type'],
+                                   filters['model_owner'], start, end)
+    sizes = data.semantic_sizes(path, cfg, selected)
+    # Reuse already parsed dates when adding semantic scores.
+    result = data.change_rows(selected, cfg, semantic_sizes=sizes)
+    return result
+
+
 @st.cache_data(show_spinner=False, max_entries=16)
-def load_sizes(path, stamp, cfg_json, events_json):
-    return data.semantic_sizes(path, configuration(json.loads(cfg_json)), json.loads(events_json))
+def load_inventory_page(path, stamp, cfg_json, snapshot_id, filters_json, search, page):
+    return data.history.record_page(path, configuration(json.loads(cfg_json)), snapshot_id,
+                                    json.loads(filters_json), search, page)
 
 
 @st.cache_data(show_spinner=False, max_entries=32)
@@ -223,25 +248,41 @@ def change_navigation(rows, selected):
                      on_click=open_change, args=(ordered[min(len(ordered) - 1, index + 1)],))
 
 
-def current_inventory(path, cfg, snapshot_id, filters):
+def current_inventory(path, stamp, cfg_json, snapshot_id, filters):
     st.header('Current inventory')
     st.caption(f'Inventory at the end of your observation range: #{snapshot_id}, including unchanged records. '
                'Date filters apply to change views.')
     search = st.text_input('Search inventory', placeholder='Record name, ID or source')
-    count, first_rows = data.history.record_page(path, cfg, snapshot_id, filters, search, 0)
+    filters_json = json.dumps(filters, sort_keys=True)
+    count, first_rows = load_inventory_page(str(path), stamp, cfg_json, snapshot_id, filters_json, search, 0)
     if not count:
         st.info('No captured records match these category filters and search.')
         return
     pages = max(1, (count + 49) // 50)
     page_labels = [f'Page {value} of {pages}' for value in range(1, pages + 1)]
     page = page_labels.index(st.selectbox('Inventory page', page_labels)) + 1
-    rows = first_rows if page == 1 else data.history.record_page(path, cfg, snapshot_id, filters, search, page - 1)[1]
+    rows = first_rows if page == 1 else load_inventory_page(str(path), stamp, cfg_json, snapshot_id,
+                                                         filters_json, search, page - 1)[1]
     st.dataframe(pd.DataFrame(rows)[['record_name', 'record_id', 'system_group', 'system_type', 'model_owner']],
                  use_container_width=True, hide_index=True)
     st.caption(f'{count:,} matching records · 50 records per page')
     selected = st.selectbox('Open record', [row['record_id'] for row in rows])
-    with st.expander('Complete stored record'):
+    if st.checkbox('Show complete stored record'):
         render_complete_record(data.history.record_version(path, snapshot_id, selected))
+
+
+def summary_table(rows, key):
+    """Only send a page of aggregate rows to the browser."""
+    if not rows:
+        st.dataframe(pd.DataFrame(), use_container_width=True, hide_index=True)
+        return
+    pages = max(1, (len(rows) + 99) // 100)
+    if key in st.session_state:
+        st.session_state[key] = min(max(1, st.session_state[key]), pages)
+    page = int(st.number_input('Table page', min_value=1, max_value=pages, value=1, key=key))
+    st.dataframe(pd.DataFrame(rows[(page - 1) * 100:page * 100]),
+                 use_container_width=True, hide_index=True)
+    st.caption(f'{len(rows):,} summary rows · 100 per page')
 
 
 def display_value(value):
@@ -541,13 +582,17 @@ def change_detail(path, stamp, selected, cfg_json):
                 after_item = parameter_item(after_record, component, parameter)
                 before_subtitle, after_subtitle = item_subtitle(before_item), item_subtitle(after_item)
                 subtitle = after_subtitle or before_subtitle or '—'
-                if before_subtitle and after_subtitle and before_subtitle != after_subtitle:
+                if (before_subtitle and after_subtitle and before_subtitle != after_subtitle
+                        and any('subtitle' in part.casefold() for part in parts)):
                     subtitle = f'{before_subtitle} → {after_subtitle}'
+                def visible_value(side):
+                    return ' '.join(scalar_value(parts[part][side]) for part in ('Value', 'Unit')
+                                    if part in parts) or '—'
                 parameter_rows.append({'Component': component or '—', 'Parameter': parameter,
                                        'Subtitle': subtitle,
-                                       'Before': item_value(before_item), 'After': item_value(after_item),
-                                       'Before comment': str(before_item.get('comments') or '—'),
-                                       'After comment': str(after_item.get('comments') or '—')})
+                                       'Before': visible_value('old_value'), 'After': visible_value('new_value'),
+                                       'Before comment': scalar_value(parts['Comment']['old_value']) if 'Comment' in parts else '—',
+                                       'After comment': scalar_value(parts['Comment']['new_value']) if 'Comment' in parts else '—'})
             if detail_view == 'Edits':
                 st.markdown(parameter_edit_table(parameter_rows), unsafe_allow_html=True)
             else:
@@ -628,7 +673,10 @@ def main():
     if st.sidebar.button('Refresh data'):
         st.cache_data.clear()
     stamp = database_stamp(path)
-    cfg_json = config_path.read_text(encoding='utf-8')
+    dashboard_cfg = json.loads(config_path.read_text(encoding='utf-8'))
+    dashboard_cfg['show_excluded_changes'] = st.sidebar.checkbox('Show excluded changes', value=False,
+        help='Include excluded fields in change details, counts and update sizes. Stored history is unchanged.')
+    cfg_json = json.dumps(dashboard_cfg, sort_keys=True)
     snapshots = load_snapshots(str(path), stamp)
     if not snapshots:
         st.info('No history snapshots are available.')
@@ -655,35 +703,33 @@ def main():
                 key='brief_range', on_change=remember_filter, args=('range',))
             selected_ids = {label: sid for sid, label in labels.items()}
             first, last = selected_ids[first_label], selected_ids[last_label]
-    cfg, snapshots, totals, events = load(str(path), stamp, cfg_json, first, last)
-    rows = data.change_rows(events, cfg)
+    cfg, snapshots, rows, min_date, max_date = load(str(path), stamp, cfg_json, first, last)
 
     with filter_panel:
-        option_rows = load_filter_inventory(str(path), stamp, cfg_json, first, last) + events
+        option_rows = load_filter_inventory(str(path), stamp, cfg_json, first, last) + rows
         groups = sorted(data.category_counts(option_rows, 'system_group'))
         with st.expander('Category filters', expanded=False):
             st.caption('Search to include or exclude a few values. Counts are unique records across the observation range.')
             draft_groups = category_filter('System groups', 'groups', data.category_counts(option_rows, 'system_group'))
-            draft_group_rows = [row for row in option_rows if row['system_group'] in draft_groups]
+            draft_groups_set = set(draft_groups)
+            draft_group_rows = [row for row in option_rows if row['system_group'] in draft_groups_set]
             draft_types = category_filter('System types', 'types', data.category_counts(draft_group_rows, 'system_type'))
-            draft_type_rows = [row for row in draft_group_rows if row['system_type'] in draft_types]
+            draft_types_set = set(draft_types)
+            draft_type_rows = [row for row in draft_group_rows if row['system_type'] in draft_types_set]
             category_filter('Owners', 'owners', data.category_counts(draft_type_rows, 'model_owner'))
             st.button('Apply filters', on_click=apply_categories, use_container_width=True)
             if st.session_state.get('brief_category_drafts', {}) != st.session_state.get('brief_categories', {}):
                 st.caption('Pending selections. Apply filters to update the results.')
         applied = st.session_state.get('brief_categories', {})
         selected_groups = data.category_values(groups, applied.get('groups', {}))
-        group_rows = [row for row in option_rows if row['system_group'] in selected_groups]
+        selected_groups_set = set(selected_groups)
+        group_rows = [row for row in option_rows if row['system_group'] in selected_groups_set]
         types = sorted(data.category_counts(group_rows, 'system_type'))
         selected_types = data.category_values(types, applied.get('types', {}))
-        type_rows = [row for row in group_rows if row['system_type'] in selected_types]
+        selected_types_set = set(selected_types)
+        type_rows = [row for row in group_rows if row['system_type'] in selected_types_set]
         owners = sorted(data.category_counts(type_rows, 'model_owner'))
         selected_owners = data.category_values(owners, applied.get('owners', {}))
-        dates = [data.estimated_day(row).date() for row in events]
-        observation_dates = [pd.to_datetime(item['created_at'], utc=True).date() for item in snapshots
-                             if first <= item['id'] <= last]
-        dates += observation_dates
-        min_date, max_date = min(dates), max(dates)
         windows = ['All selected dates', 'Last capture', 'Last 7 days', 'Last 30 days', 'Custom dates']
         saved = st.session_state['brief_filters']
         st.session_state['brief_window'] = saved.get('window', windows[0])
@@ -721,12 +767,10 @@ def main():
             column.button(text + ' [clear]', key='clear_' + name,
                           on_click=clear_dimension, args=(name,))
     capture_rows = [row for row in rows if row['snapshot_id'] == last] if window == 'Last capture' else rows
-    filtered = data.filter_changes(capture_rows, selected_groups, selected_types, selected_owners, start, end)
-    if filtered:
-        selected_keys = {(row['snapshot_id'], row['record_id']) for row in filtered}
-        selected_events = [row for row in events if (row['snapshot_id'], row['record_id']) in selected_keys]
-        sizes = load_sizes(str(path), stamp, cfg_json, json.dumps(selected_events))
-        filtered = data.change_rows(selected_events, cfg, semantic_sizes=sizes)
+    filtered = []
+    if page not in ('Current inventory', 'Structure changes') or st.query_params.get('record'):
+        filtered = load_filtered_rows(str(path), stamp, cfg_json, first, last,
+                                      json.dumps(filters, sort_keys=True), start, end, window == 'Last capture')
 
     requested_record = st.query_params.get('record')
     requested_snapshot = st.query_params.get('snapshot')
@@ -740,10 +784,10 @@ def main():
             change_navigation(filtered, selected)
             change_detail(path, stamp, selected, cfg_json)
             return
-        st.warning('That change is no longer available in the selected history database.')
+        st.warning('That change is unavailable or hidden by the current filters. Enable Show excluded changes to review hidden edits.')
 
     if page == 'Current inventory':
-        current_inventory(path, cfg, last, filters)
+        current_inventory(path, stamp, cfg_json, last, filters)
         return
     if page != 'Structure changes':
         with st.expander('Change summary', expanded=False):
@@ -766,6 +810,7 @@ def main():
     elif page == 'Changes over time':
         st.header('Changes over time')
         summary = data.time_summary(filtered)
+        st.caption('Long date ranges are combined into at most 400 equal-width date buckets; totals include every update.')
         if summary:
             st.altair_chart(alt.Chart(alt.Data(values=summary)).mark_bar().encode(
                 x=alt.X('date:T', title='Best estimated change date'), y=alt.Y('updates:Q', title='Record updates'),
@@ -777,21 +822,22 @@ def main():
         st.header('Changes by system type')
         st.caption('System group and system type are shown together so similarly named types remain in context.')
         summary = data.system_summary(filtered)
-        st.dataframe(pd.DataFrame(summary), use_container_width=True, hide_index=True)
+        summary_table(summary, 'system_summary_page')
         if summary:
-            st.altair_chart(alt.Chart(alt.Data(values=summary)).mark_bar().encode(
+            st.caption('Chart shows the 50 most affected group/type combinations. The table includes all combinations.')
+            st.altair_chart(alt.Chart(alt.Data(values=summary[:50])).mark_bar().encode(
                 y=alt.Y('system_type:N', title='System type', sort='-x'),
                 x=alt.X('record_updates:Q', title='Record updates'),
                 color=alt.Color('system_group:N', title='System group'),
                 tooltip=['system_group:N', 'system_type:N', 'record_updates:Q', 'unique_records:Q']
-            ).properties(height=max(320, len(summary) * 30)), use_container_width=True)
+            ).properties(height=max(320, min(len(summary), 50) * 30)), use_container_width=True)
     else:
         st.header('Structure changes')
         st.caption('Field additions, removals, and shape changes are kept separate from record edits and size rankings.')
         filters = {'system_group': selected_groups, 'system_type': selected_types, 'model_owner': selected_owners}
         structure = load_structure(str(path), stamp, cfg_json, last if window == 'Last capture' else first,
                                    last, json.dumps(filters), start, end)
-        st.dataframe(pd.DataFrame(structure), use_container_width=True, hide_index=True)
+        summary_table(structure, 'structure_summary_page')
         if not structure:
             st.info('No structure changes match this observation range and filters.')
 

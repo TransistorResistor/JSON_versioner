@@ -50,7 +50,9 @@ def database_stamp(path):
 
 @st.cache_data(show_spinner=False, max_entries=4)
 def load_period(path, stamp, cfg_json, start, end):
-    return data.period_data(path, json.loads(cfg_json), start, end)
+    cfg = json.loads(cfg_json)
+    totals, events = data.period_data(path, cfg, start, end)
+    return totals, data.visible_events(path, cfg, events)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -397,8 +399,9 @@ def record_detail(path, stamp, cfg, snapshots, record_id, default_before=None, d
                                 f'record_{fingerprint(record_id)}_{sid}.json', 'application/json', key='download_'+name)
         else:
             col.info(f'{name}: record absent.')
+    diffs = [row for row in diffs if data.display_path_visible(row['field'], cfg)]
     if not diffs:
-        st.success('No differences between these stored versions.')
+        st.success('No visible differences between these stored versions.')
     else:
         st.write(f'{len(diffs):,} changed fields')
         table(diffs, 'endpoint_differences')
@@ -431,9 +434,11 @@ def explorer(path, stamp, cfg, snapshots, period, events, filters, include_basel
     selected_event = None
     if mode == 'Change events':
         kinds = st.multiselect('Change kinds', ['added', 'removed', 'modified', 'schema only', 'source moved'], default=['added', 'removed', 'modified'])
-        minimum = st.slider('Minimum weighted change (%) for modifications', 0, 100, 0)
+        minimum = st.select_slider('Minimum update size for modifications',
+                                   options=['Small', 'Medium', 'Large'], value='Small')
+        size_rank = {'Small': 0, 'Medium': 1, 'Large': 2}
         rows = [r for r in events if r['kind'] in kinds and (include_baseline or r['previous_id'] is not None)
-                and (r['kind'] != 'modified' or 100*(r['weighted_ratio'] or 0) >= minimum)
+                and (r['kind'] != 'modified' or size_rank[r['overall_update_size']] >= size_rank[minimum])
                 and search in (r['record_id']+' '+r['record_name']+' '+(r['filename'] or '')).casefold()]
         rows.sort(key=lambda r: (-r['snapshot_id'], r['record_id']))
         st.caption(f'{len(rows):,} events match. Event classifications and owner values reflect the record at that event.')
@@ -444,7 +449,9 @@ def explorer(path, stamp, cfg, snapshots, period, events, filters, include_basel
                                key='events_page_'+fingerprint((filters, search, kinds, minimum, period[0]['id'], period[-1]['id'], include_baseline)))
         page_rows = rows[(page-1)*50:page*50]
         shown = [{k: r[k] for k in ['snapshot_id', 'record_id', 'record_name', 'kind', 'system_group', 'system_type', 'model_owner',
-                                   'fields_changed', 'weighted_ratio', 'created_at']} for r in page_rows]
+                                   'fields_changed', 'created_at']} | {
+                                       'update_size': r.get('overall_update_size', r['kind'].title())}
+                 for r in page_rows]
         selectable = 'on_select' in inspect.signature(st.dataframe).parameters
         if selectable:
             selection = st.dataframe(shown, use_container_width=True, hide_index=True, on_select='rerun',
@@ -545,10 +552,12 @@ def main():
     if local.exists():
         display = json.loads(local.read_text(encoding='utf-8'))
         for key in ('group_fields', 'type_fields', 'owner_fields', 'name_fields',
-                    'content_categories', 'description_edit_thresholds', 'combined_update_size', 'array_keys'):
+                    'content_categories', 'description_edit_thresholds', 'combined_update_size', 'array_keys', 'dashboard_display'):
             if key in display:
                 cfg[key] = display[key]
     cfg = configuration(cfg)
+    cfg['show_excluded_changes'] = st.sidebar.checkbox('Show excluded changes', value=False,
+        help='Include excluded fields in change details, counts and update sizes. Stored history is unchanged.')
     cfg_json = json.dumps(cfg, sort_keys=True)
     stamp = database_stamp(path)
     with st.spinner('Loading category history…'):

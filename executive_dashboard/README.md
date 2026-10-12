@@ -23,6 +23,14 @@ The sidebar accepts an existing JSON Versioner `history.sqlite3` and `config.jso
 
 All views share observation-range, system-group, system-type, owner, and estimated-date filters, including Structure changes. The default range is the latest 30 observations; choose a wider or earlier range in the sidebar. History queries are bounded to that range, and semantic change sizes are calculated after filtering. The activity feed and largest-changes table paginate their rendered results. Baseline-only, unchanged, and structure-only histories remain navigable.
 
+## Performance and large histories
+
+Prepared change rows and date bounds are cached per source, database/WAL modification stamp, configuration, and observation range. Filtered semantic scores use a compact selection key rather than serializing all events on every rerun. Both large caches retain at most four entries. Date parsing is shared for identical timestamp pairs, and category membership uses sets. Inventory pages are cached separately, and inventory/structure views skip semantic scoring.
+
+The executive loader skips the unused population aggregation. All reads retain the existing read-only connections and transactions; collection, versioning, stored scores, schema, and compression are unchanged. Existing classification metadata lets overview queries avoid decompressing full stored JSON. Legacy histories and configurations requesting classification fields absent from that metadata still use the existing full-record fallback.
+
+Browser payloads are bounded: feed and change tables retain their existing pagination, inventory sends 50 records per page, and system/structure summaries send 100 rows per page. The system chart shows the top 50 group/type combinations, while the table retains every combination. Time charts use at most 400 equal-width date buckets (up to five size bands each) and preserve all update totals. Complete inventory records load only when **Show complete stored record** is selected.
+
 Change details compare with the actual previous stored version, including across capture gaps. Preview choices include snapshot IDs so several versions captured on the same day remain individually selectable. Direct change links remain usable even outside the selected observation range.
 
 The collapsed **Capture details** panel shows the latest stored observation time in UTC, captured record count, unavailable-record count, and predecessor. The collapsed **Change summary** panel contains update totals, size counts, and most affected system types, keeping the record views prominent. Capture gaps are explained separately from removals. These values describe stored history; CSV download times and failed collection attempts require separate downloader/run-status integration.
@@ -42,9 +50,13 @@ See [`demo/README.md`](demo/README.md) for a repeatable four-snapshot dataset ba
 Comparison and presentation exclusions are deliberately separate:
 
 - `ignore_fields` and `ignore_paths` are opt-out rules applied before comparison. Matching values do not create stored changes.
-- `dashboard_display.exclude_parameter_fields` hides named leaves such as `uom` or `comments` only in the executive dashboard.
-- `dashboard_display.exclude_description_fields` hides named leaves within description items.
-- `dashboard_display.exclude_other_paths` hides exact or normalized paths elsewhere; array selectors normalize to `[]`.
+- `dashboard_display.exclude_parameter_fields` excludes named leaves such as `uom` or `comments` from both dashboards.
+- `dashboard_display.exclude_description_fields` excludes named leaves within description items.
+- `dashboard_display.exclude_other_paths` excludes exact or normalized paths in any category, including parameters; array selectors normalize to `[]`.
+
+Dashboard exclusions filter change details, event counts, field counts, word counts, and update sizes. Modified events with no visible non-schema changes are hidden; whole-record additions and removals remain visible. The sidebar **Show excluded changes** toggle restores excluded fields and recalculates the metrics, without changing stored history. Complete stored record views and JSON downloads retain all captured fields.
+
+The existing `dashboard_display` name is retained for compatibility; these settings now control dashboard metrics as well as presentation.
 
 Dashboard exclusions are also opt-out: new fields remain visible until deliberately excluded. Parameter identity and context fields can still supply the component, parameter name, and subtitle used in natural labels and the complete-record view.
 

@@ -99,6 +99,40 @@ def snapshots(path):
         return [dict(r) for r in db.execute(query)]
 
 
+def display_path_visible(path, cfg):
+    """Apply dashboard filters without changing captured history."""
+    if cfg.get('show_excluded_changes', False):
+        return True
+    display = cfg.get('dashboard_display', {})
+    leaf = path.rsplit('.', 1)[-1].casefold()
+    if path.startswith('$.parametrics['):
+        excluded = display.get('exclude_parameter_fields',
+            ['parameterDescr', 'parameterOnly', 'seq', 'dataType', 'parameter', 'component'])
+        if leaf in {value.casefold() for value in excluded}:
+            return False
+    if path.startswith('$.descriptions['):
+        if leaf in {value.casefold() for value in display.get('exclude_description_fields', [])}:
+            return False
+    normalized = re.sub(r'\[[^]]*\]', '[]', path)
+    excluded = display.get('exclude_other_paths', [])
+    return path not in excluded and normalized not in excluded
+
+
+def visible_events(path, cfg, events):
+    """Keep modifications only when visible non-schema changes remain."""
+    counts = Counter()
+    details = content_change_details(path, cfg, events)
+    sizes = {(row['snapshot_id'], row['record_id']): row
+             for row in combined_update_sizes(details, cfg)}
+    for item in details:
+        counts[item['snapshot_id'], item['record_id']] += item['field_edits']
+    return [{**event, **sizes[event['snapshot_id'], event['record_id']],
+             'fields_changed': counts[event['snapshot_id'], event['record_id']]}
+            if event['kind'] == 'modified' else event
+            for event in events if event['kind'] != 'modified'
+            or counts[event['snapshot_id'], event['record_id']]]
+
+
 def period_data(path, cfg, start, end):
     with connect(path, cfg) as db:
         totals = [dict(r) for r in db.execute('''SELECT snapshot_id,system_group,system_type,model_owner,COUNT(*) AS population
@@ -193,6 +227,8 @@ def field_scope(path, cfg, event_keys):
         db.executemany('INSERT OR IGNORE INTO selected_events VALUES(?,?)', event_keys)
         for r in db.execute('''SELECT f.snapshot_id,f.record_id,f.json_path,f.word_edits FROM field_changes f
             JOIN selected_events e USING(snapshot_id,record_id) WHERE f.schema_only=0'''):
+            if not display_path_visible(r['json_path'], cfg):
+                continue
             field = re.sub(r'\[[^]]*\]', '[]', r['json_path'])
             item = stats[field]
             item['records'].add(r['record_id'])
@@ -266,16 +302,21 @@ def content_change_details(path, cfg, events):
                 'item': content_item_label(item_path), 'field_edits': 0, 'word_edits': 0,
                 'has_word_edit': False, 'all_old_missing': True, 'all_new_missing': True,
                 'changed_fields': set()})
-            item['field_edits'] += 1
             item['changed_fields'].add(row['json_path'].rsplit('.', 1)[-1])
             item['all_old_missing'] &= row['old_value'] is None
             item['all_new_missing'] &= row['new_value'] is None
+            if not display_path_visible(row['json_path'], cfg):
+                continue
+            item['field_edits'] += 1
+            item.setdefault('visible_fields', set()).add(row['json_path'].rsplit('.', 1)[-1])
             if row['word_edits'] is not None:
                 item['has_word_edit'] = True
                 item['word_edits'] += row['word_edits']
     thresholds = cfg.get('description_edit_thresholds', {'small': 50, 'medium': 250})
     result = []
     for item in groups.values():
+        if not item['field_edits']:
+            continue
         array_base = item['item_path'].split('[', 1)[0] if '[' in item['item_path'] else None
         key_spec = cfg.get('array_keys', {}).get(array_base) if array_base else None
         identity_fields = {key_spec} if isinstance(key_spec, str) else set(key_spec or [])
@@ -305,7 +346,7 @@ def content_change_details(path, cfg, events):
         item.pop('all_old_missing')
         item.pop('all_new_missing')
         item.pop('has_word_edit')
-        item['changed_fields'] = ', '.join(sorted(item['changed_fields']))
+        item['changed_fields'] = ', '.join(sorted(item.pop('visible_fields')))
         result.append(item)
     return sorted(result, key=lambda row: (row['snapshot_id'], row['record_id'], row['content_category'], row['item']))
 

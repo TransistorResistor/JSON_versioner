@@ -51,13 +51,22 @@ def load_config(path: str | Path) -> dict:
     return read_config(path)
 
 
-def load_history(path: str | Path, cfg: dict, start_snapshot=None, end_snapshot=None) -> tuple[list[dict], list[dict], list[dict]]:
+def load_history(path: str | Path, cfg: dict, start_snapshot=None, end_snapshot=None,
+                 include_totals=True) -> tuple[list[dict], list[dict], list[dict]]:
     snapshots = history.snapshots(path)
     if not snapshots:
         return [], [], []
     start_snapshot = snapshots[max(0, len(snapshots) - 30)]['id'] if start_snapshot is None else start_snapshot
     end_snapshot = snapshots[-1]['id'] if end_snapshot is None else end_snapshot
-    totals, events = history.period_data(path, cfg, start_snapshot, end_snapshot)
+    if include_totals:
+        totals, events = history.period_data(path, cfg, start_snapshot, end_snapshot)
+    else:
+        # Executive views need change headers, not the population aggregation.
+        with history.connect(path, cfg) as db:
+            events = [dict(row) for row in db.execute('''SELECT * FROM events
+                WHERE snapshot_id BETWEEN ? AND ? ORDER BY snapshot_id,record_id''',
+                (start_snapshot, end_snapshot))]
+        totals = []
     return snapshots, totals, events
 
 
@@ -88,7 +97,14 @@ def estimated_day(event: dict) -> pd.Timestamp:
 def change_rows(events: list[dict], cfg: dict, include_baseline: bool = False,
                 semantic_sizes: dict[tuple[int, str], dict] | None = None) -> list[dict]:
     rows = []
+    dates = {}
     for event in history.meaningful(events, include_baseline):
+        if (semantic_sizes is not None and event['kind'] == 'modified'
+                and (event['snapshot_id'], event['record_id']) not in semantic_sizes):
+            continue
+        date_key = (event.get('estimated_at'), event['created_at'])
+        if date_key not in dates:
+            dates[date_key] = event.get('estimated_day') if event.get('estimated_day') is not None else estimated_day(event)
         semantic = (semantic_sizes or {}).get((event['snapshot_id'], event['record_id']))
         size = size_label(event, cfg, semantic)
         verb = {'added': 'added', 'removed': 'removed', 'modified': 'edited'}[event['kind']]
@@ -96,7 +112,8 @@ def change_rows(events: list[dict], cfg: dict, include_baseline: bool = False,
         noun = 'item' if semantic else 'field'
         description = f'{fields:,} {noun}{"s" if fields != 1 else ""} edited' if event['kind'] == 'modified' else f'Record {verb}'
         rows.append({**event, 'size': size, 'size_rank': SIZE_ORDER[size],
-                     'estimated_day': estimated_day(event),
+                     'change_units': semantic.get('change_units', fields) if semantic else fields,
+                     'estimated_day': dates[date_key],
                      'title': f"{event.get('record_name') or event['record_id']} {verb}",
                      'description': description, 'display_change_count': fields,
                      'size_explanation': size_explanation(event, cfg, semantic)})
@@ -127,6 +144,7 @@ def semantic_sizes(path: str | Path, cfg: dict, events: list[dict]) -> dict[tupl
 
 def filter_changes(rows: list[dict], groups: list[str], types: list[str], owners: list[str],
                    start, end) -> list[dict]:
+    groups, types, owners = set(groups), set(types), set(owners)
     start = pd.Timestamp(start, tz='UTC') if start else None
     end = pd.Timestamp(end, tz='UTC') + pd.Timedelta(days=1) if end else None
     return [row for row in rows
@@ -139,9 +157,9 @@ def sort_changes(rows: list[dict], order: str) -> list[dict]:
     if order == 'Most recent first':
         return sorted(rows, key=lambda row: (row['estimated_day'], row['snapshot_id'], row['size_rank'], row['record_id']), reverse=True)
     if order == 'Smallest first':
-        return sorted(rows, key=lambda row: (row['size_rank'], row.get('weighted_ratio') or 0, row['estimated_day'], row['snapshot_id'], row['record_id']))
-    return sorted(rows, key=lambda row: (row['size_rank'], row.get('weighted_ratio') or 0,
-                                          row.get('fields_changed') or 0, row['estimated_day'], row['snapshot_id'], row['record_id']), reverse=True)
+        return sorted(rows, key=lambda row: (row['size_rank'], row['change_units'], row['estimated_day'], row['snapshot_id'], row['record_id']))
+    return sorted(rows, key=lambda row: (row['size_rank'], row['change_units'],
+                                          row['estimated_day'], row['snapshot_id'], row['record_id']), reverse=True)
 
 
 def change_fields(path: str | Path, snapshot_id: int, record_id: str, schema_only: int = 0,
@@ -215,31 +233,16 @@ def inline_word_diff(before: str, after: str) -> str:
 
 def minimise_parameter_fields(rows: list[dict], cfg: dict | None = None) -> list[dict]:
     """Keep non-excluded fields, collapsing duplicate value/unit representations."""
-    display = (cfg or {}).get('dashboard_display', {})
-    excluded_params = {str(value).casefold() for value in display.get(
-        'exclude_parameter_fields', ['parameterDescr', 'parameterOnly', 'seq', 'dataType', 'parameter', 'component'])}
-    excluded_descriptions = {str(value).casefold() for value in display.get('exclude_description_fields', [])}
-    excluded_other = display.get('exclude_other_paths', [])
-    result = []
-    for row in rows:
-        path = row['json_path']
-        leaf = path.rsplit('.', 1)[-1].casefold()
-        if path.startswith('$.parametrics['):
-            continue
-        if path.startswith('$.descriptions[') and leaf in excluded_descriptions:
-            continue
-        normalized = re.sub(r'\[[^]]*\]', '[]', path)
-        if path in excluded_other or normalized in excluded_other:
-            continue
-        result.append(row)
+    cfg = cfg or {}
+    rows = [row for row in rows if history.display_path_visible(row['json_path'], cfg)]
+    result = [row for row in rows if not row['json_path'].startswith('$.parametrics[')]
     grouped = defaultdict(list)
     for row in rows:
         if row['json_path'].startswith('$.parametrics['):
             grouped[row['json_path'].rsplit('.', 1)[0]].append(row)
     for item_rows in grouped.values():
-        by_leaf = {row['json_path'].rsplit('.', 1)[-1].casefold(): row for row in item_rows
-                   if row['json_path'].rsplit('.', 1)[-1].casefold() not in excluded_params}
-        if 'parameteruomvalue' in by_leaf:
+        by_leaf = {row['json_path'].rsplit('.', 1)[-1].casefold(): row for row in item_rows}
+        if 'parameteruomvalue' in by_leaf and not cfg.get('show_excluded_changes', False):
             by_leaf.pop('parametervalue', None)
             by_leaf.pop('uom', None)
         result.extend(by_leaf.values())
@@ -274,14 +277,23 @@ def system_summary(rows: list[dict]) -> list[dict]:
                   key=lambda row: (-row['record_updates'], row['system_group'], row['system_type']))
 
 
-def time_summary(rows: list[dict]) -> list[dict]:
-    counts = Counter((row['estimated_day'].floor('D'), row['size']) for row in rows)
+def time_summary(rows: list[dict], max_buckets: int = 400) -> list[dict]:
+    if not rows:
+        return []
+    # At most five size bands per bucket, even for decades of daily history.
+    first = min(row['estimated_day'] for row in rows).floor('D')
+    last = max(row['estimated_day'] for row in rows).floor('D')
+    width = max(1, ((last - first).days + max_buckets) // max_buckets)
+    counts = Counter((first + pd.Timedelta(days=((row['estimated_day'] - first).days // width) * width),
+                      row['size']) for row in rows)
     return [{'date': day, 'size': size, 'updates': count}
             for (day, size), count in sorted(counts.items())]
 
 
 def structure_changes(path: str | Path, cfg: dict, start_snapshot: int, end_snapshot: int,
                       filters=None, start=None, end=None) -> list[dict]:
+    filters = {key: set(values) for key, values in filters.items()} if filters is not None else None
+    dates = {}
     start = pd.Timestamp(start, tz='UTC') if start else None
     end = pd.Timestamp(end, tz='UTC') + pd.Timedelta(days=1) if end else None
     with history.connect(path, cfg) as db:
@@ -291,9 +303,14 @@ def structure_changes(path: str | Path, cfg: dict, start_snapshot: int, end_snap
             WHERE f.schema_only=1 AND f.snapshot_id BETWEEN ? AND ?''', (start_snapshot, end_snapshot))
         grouped = {}
         for row in raw:
+            if not history.display_path_visible(row['json_path'], cfg):
+                continue
             if filters is not None and any(row[key] not in values for key, values in filters.items()):
                 continue
-            stamp = pd.to_datetime(row['estimated_at'] or row['created_at'], utc=True)
+            date_key = (row['estimated_at'], row['created_at'])
+            if date_key not in dates:
+                dates[date_key] = estimated_day(dict(row))
+            stamp = dates[date_key]
             if (start is not None and stamp < start) or (end is not None and stamp >= end):
                 continue
             normalized = re.sub(r'\[[^]]*\]', '[]', row['json_path'])
