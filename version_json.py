@@ -12,12 +12,11 @@ import sqlite3
 import sys
 import time
 from contextlib import ExitStack
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 from configuration import load_config
 from comparison import (
@@ -39,7 +38,9 @@ def source_owner(value, cfg, owner):
         return value
     fields = cfg.get('owner_fields', ['modelOwner'])
     result = {key: child for key, child in value.items() if key not in fields}
-    if fields and owner is not None and str(owner).strip():
+    if (fields and owner is not None and str(owner).strip()
+            and fields[0] not in cfg['ignore_fields']
+            and not path_matches('$.' + fields[0], cfg['ignore_paths'])):
         result[fields[0]] = str(owner).strip()
     return result
 
@@ -80,6 +81,8 @@ def identity(data, filename, cfg):
 def reported_update(data, cfg):
     if isinstance(data, dict):
         for field in cfg.get('updated_at_fields', ['updated_at']):
+            if field in cfg.get('ignore_fields', []) or path_matches('$.' + field, cfg.get('ignore_paths', [])):
+                continue
             value = data.get(field)
             if isinstance(value, (str, int, float)) and not isinstance(value, bool) and str(value).strip():
                 return str(value).strip()
@@ -282,10 +285,69 @@ def https_session(verify=True):
     session = HTTPSession()
     session.verify = verify
     session.headers.update({'Accept': 'application/json', 'User-Agent': 'json-versioner/2.0'})
-    retries = Retry(total=3, backoff_factor=.5, allowed_methods={'GET'},
-                    status_forcelist=(429, 500, 502, 503, 504))
-    session.mount('https://', HTTPAdapter(max_retries=retries))
     return session
+
+
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+MAX_GET_RETRIES = 3
+MAX_RETRY_DELAY = 60
+
+
+def retry_delay(retry_after, attempt, now=None):
+    """Prefer Retry-After seconds/HTTP-date; cap each wait at one minute."""
+    if isinstance(retry_after, str):
+        try:
+            if re.fullmatch(r'\d+', retry_after.strip()):
+                return min(int(retry_after.strip()), MAX_RETRY_DELAY)
+            date = parsedate_to_datetime(retry_after)
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=dt.timezone.utc)
+            now = now or dt.datetime.now(dt.timezone.utc)
+            return min(max(0, (date-now).total_seconds()), MAX_RETRY_DELAY)
+        except (ValueError, TypeError, OverflowError):
+            pass
+    return min(.5 * 2**attempt, MAX_RETRY_DELAY)
+
+
+def fetch_payload(session, url, timeout, timing):
+    """Retry the GET and entire streamed body without replacing session adapters."""
+    timing.update({'retries': 0, 'request_wait_seconds': 0,
+                   'download_seconds': 0, 'retry_wait_seconds': 0})
+    for attempt in range(MAX_GET_RETRIES + 1):
+        timing['retries'] = attempt
+        started = time.perf_counter()
+        headers_at = None
+        try:
+            with session.get(url, timeout=(min(timeout, 10), timeout), stream=True) as response:
+                headers_at = time.perf_counter()
+                timing['status'] = response.status_code
+                if response.status_code in RETRYABLE_STATUS and attempt < MAX_GET_RETRIES:
+                    delay = retry_delay(response.headers.get('Retry-After'), attempt)
+                else:
+                    response.raise_for_status()
+                    # Each attempt starts fresh; partial bytes never reach JSON parsing/staging.
+                    payload = bytearray()
+                    for chunk in response.iter_content(chunk_size=65536):
+                        payload.extend(chunk)
+                        if len(payload) > 20_000_000:
+                            raise ValueError('response exceeds 20 MB (after decompression)')
+                    return payload
+        except requests.exceptions.SSLError:
+            raise
+        except (requests.ConnectionError, requests.Timeout,
+                requests.exceptions.ChunkedEncodingError, TimeoutError):
+            if attempt == MAX_GET_RETRIES:
+                raise
+            delay = retry_delay(None, attempt)
+        finally:
+            ended = time.perf_counter()
+            timing['request_wait_seconds'] += (headers_at if headers_at is not None else ended) - started
+            if headers_at is not None:
+                timing['download_seconds'] += ended - headers_at
+        # The response context has closed before any backoff or next attempt.
+        waiting_at = time.perf_counter()
+        time.sleep(delay)
+        timing['retry_wait_seconds'] += time.perf_counter() - waiting_at
 
 
 def scan_urls(source, cfg, template, column, timeout, prefix=None, result=None, session=None,
@@ -321,18 +383,7 @@ def scan_urls(source, cfg, template, column, timeout, prefix=None, result=None, 
                 timings.append(timing)
             continue
         try:
-            with session.get(url, timeout=(min(timeout, 10), timeout), stream=True) as response:
-                headers_at = time.perf_counter()
-                timing['status'] = response.status_code
-                retry_state = getattr(getattr(response, 'raw', None), 'retries', None)
-                retry_history = getattr(retry_state, 'history', ())
-                timing['retries'] = len(retry_history) if isinstance(retry_history, (list, tuple)) else 0
-                response.raise_for_status()
-                payload = bytearray()
-                for chunk in response.iter_content(chunk_size=65536):
-                    payload.extend(chunk)
-                    if len(payload) > 20_000_000:
-                        raise ValueError('response exceeds 20 MB (after decompression)')
+            payload = fetch_payload(session, url, timeout, timing)
             body_at = time.perf_counter()
             raw = json.loads(payload.decode('utf-8-sig'))
             parsed_at = time.perf_counter()
@@ -365,8 +416,6 @@ def scan_urls(source, cfg, template, column, timeout, prefix=None, result=None, 
             completed_at = time.perf_counter()
             if timings is not None:
                 timing.update({'bytes': len(payload),
-                               'request_wait_seconds': headers_at-started,
-                               'download_seconds': body_at-headers_at,
                                'json_parse_seconds': parsed_at-body_at,
                                'normalize_seconds': normalized_at-parsed_at,
                                'hash_seconds': hashed_at-normalized_at,
@@ -402,7 +451,7 @@ def benchmark_urls(args):
             _, errors = scan_urls(source, cfg, args.url_template, args.column, args.timeout,
                                   args.url_prefix, staged, session, sampled, timings)
     successful = [row for row in timings if 'error' not in row]
-    phase_names = ('request_wait_seconds', 'download_seconds', 'json_parse_seconds',
+    phase_names = ('request_wait_seconds', 'download_seconds', 'retry_wait_seconds', 'json_parse_seconds',
                    'normalize_seconds', 'hash_seconds', 'stage_seconds')
     phase_totals = {name: round(sum(row.get(name, 0) for row in successful), 3) for name in phase_names}
     dominant = max(phase_totals, key=phase_totals.get) if successful else None
@@ -487,7 +536,8 @@ def snapshot(args, current, resources):
     if previous_row:
         old_cfg = json.loads(previous_row[2])
         if any(old_cfg.get(k) != cfg.get(k) for k in COMPARISON_KEYS):
-            raise ValueError('Comparison settings changed; use a new --history directory for a new baseline')
+            raise ValueError('Comparison settings changed; use a new --history directory for a new baseline, '
+                             'or --rebaseline to permanently scrub newly ignored fields from existing history')
     previous = PreviousRecords(db, previous_id)
     previous_gaps = {}
     if previous_id is not None:
@@ -525,7 +575,9 @@ def snapshot(args, current, resources):
                          (timestamp, previous_id, str(source), args.note, canonical(cfg)))
         sid = cur.lastrowid
         db.executemany('INSERT INTO snapshot_gaps VALUES(?,?,?,?,?)',
-                       ((sid, record_id, source_url, owner, reason)
+                       ((sid, record_id, source_url,
+                         None if any(field in cfg['ignore_fields'] or path_matches('$.' + field, cfg['ignore_paths'])
+                                     for field in cfg['owner_fields']) else owner, reason)
                         for record_id, source_url, owner, reason in gaps))
         for rid, hash_ in current.hashes.items():
             if not db.execute('SELECT 1 FROM record_blobs WHERE hash=?', (hash_,)).fetchone():
@@ -607,13 +659,20 @@ def main():
                         help='Time a random read-only sample of N URL records (default: 10) without writing history')
     parser.add_argument('--list', action='store_true', help='Show snapshot history')
     parser.add_argument('--compact-storage', action='store_true', help='Back up, compress/deduplicate legacy records, and reclaim free space')
+    parser.add_argument('--rebaseline', action='store_true',
+                        help='Permanently scrub newly ignored fields from ALL history; requires typed confirmation')
     args = parser.parse_args()
     try:
         if args.timeout <= 0:
             raise ValueError('--timeout must be positive')
         if args.benchmark is not None and args.benchmark <= 0:
             raise ValueError('--benchmark sample size must be positive')
-        if args.compact_storage:
+        if args.rebaseline:
+            if args.source or args.list or args.compact_storage or args.benchmark is not None:
+                raise ValueError('--rebaseline cannot be combined with source, --list, --compact-storage or --benchmark')
+            from rebaseline import rebaseline
+            rebaseline(args.history, args.config, dry_run=args.dry_run)
+        elif args.compact_storage:
             path = args.history / 'history.sqlite3'
             if not path.is_file():
                 raise ValueError(f'No database at {path}')
@@ -634,7 +693,7 @@ def main():
         elif args.source:
             run(args)
         else:
-            parser.error('source is required unless --list is used')
+            parser.error('source is required unless --list, --compact-storage or --rebaseline is used')
     except (ValueError, sqlite3.Error, OSError) as exc:
         parser.exit(1, f'Error: {exc}\n')
 
