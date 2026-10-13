@@ -2,6 +2,8 @@
 
 Licensed under the [MIT License](LICENSE).
 
+For snapshot/date filter failures, network-share access, or relationships that seem reordered or re-added, see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+
 Python scripts keep semantic snapshots of a JSON directory or a list of JSON URLs and show changes in a Streamlit dashboard. Python 3.11+ works on Windows 10/11. SQLite and zlib compression are bundled with Python. Streamlit powers the dashboard; `openpyxl` reads Excel lists; Requests provides pooled HTTPS connections. No service, Git, or administrator rights are needed. URL mode needs access to the specified URLs.
 
 ## Windows setup
@@ -32,6 +34,10 @@ streamlit run dashboard.py
 The second snapshot should show one modified and one unchanged record. Store your actual JSON export outside this repository if you prefer; the snapshot database stays local in `json_history/`.
 
 The dashboard focuses on **scale, scope, and timing across aggregate categories**, with system types as the default comparison. Choose an observation range and filter by `systemGroup`, `systemType`, and root-level `modelOwner`. Missing values appear as `(Unspecified)`. The first snapshot is excluded from change counts by default because it is a baseline inventory; enable **Include initial baseline as additions** when needed.
+
+Both dashboards accept local database paths, Windows UNC paths such as `\\server\share\history.sqlite3` or `//server/share/history.sqlite3`, and `file://server/share/history.sqlite3` addresses. Server hostnames, IP addresses, administrative shares such as `C$`, spaces, and literal `#`/`%` in ordinary filenames are supported. For file addresses, encode filename `#`/`%` as `%23`/`%25`. The executive dashboard accepts these forms for its configuration file too. Paths are read by the machine and account running Streamlit, so that account needs access to the share; browser-machine access alone is insufficient. HTTP URLs and database-server connection addresses cannot be opened as SQLite files. On non-Windows hosts, mount the share and use its local filesystem path.
+
+History connections remain read-only and preserve SQLite locking and change detection. Network access still depends on filesystem reliability and permissions. SQLite WAL mode does not support database access across hosts on a network filesystem; use a local database on the Streamlit host or an appropriate closed, consistent database copy in that situation. See [SQLite network filesystem guidance](https://www.sqlite.org/useovernet.html) and [WAL limitations](https://www.sqlite.org/wal.html). The dashboards do not change journal mode or bypass locks.
 
 ### Dashboard views
 

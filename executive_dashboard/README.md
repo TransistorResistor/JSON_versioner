@@ -2,6 +2,8 @@
 
 A read-only Streamlit dashboard for reviewing substantial record changes without treating structure-only changes as edits.
 
+See [dashboard troubleshooting](../TROUBLESHOOTING.md) for snapshot/date filter failures, network-share paths, and relationships that seem reordered or re-added.
+
 ## Run
 
 From the repository root:
@@ -11,6 +13,8 @@ python -m streamlit run executive_dashboard/app.py
 ```
 
 The sidebar accepts an existing JSON Versioner `history.sqlite3` and `config.json`. The shared dashboard data layer opens the selected history read-only.
+
+Database and configuration paths may be local, Windows UNC (`\\server\share\history.sqlite3` or `//server/share/history.sqlite3`), or file addresses (`file://server/share/history.sqlite3`). The account running Streamlit must be able to access the share. Administrative shares (`C$`), IP-address hosts, spaces, and filename punctuation are preserved. HTTP/database-server URLs are not SQLite file paths. SQLite network locking and WAL limitations still apply; see the root README's network path guidance.
 
 ## Views
 

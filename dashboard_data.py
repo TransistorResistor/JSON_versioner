@@ -6,10 +6,12 @@ import html
 import json
 import re
 import sqlite3
+import os
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
+from urllib.parse import quote, unquote, urlsplit
 
 import pandas as pd
 
@@ -30,6 +32,50 @@ class MissingRecord(Enum):
 ABSENT = MissingRecord.ABSENT
 
 
+def dashboard_path(value):
+    """Accept local filenames, Windows UNC shares and file:// addresses."""
+    text = str(value).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ('"', "'"):
+        text = text[1:-1]
+    if not text:
+        raise ValueError('Enter a database or configuration file path')
+    if re.match(r'^[A-Za-z][A-Za-z0-9+.-]*://', text):
+        parsed = urlsplit(text)
+        if parsed.scheme.casefold() != 'file':
+            raise ValueError('Use a local file or UNC share path such as \\\\server\\share\\history.sqlite3; '
+                             'SQLite cannot open an HTTP or database-server URL')
+        if parsed.query or parsed.fragment or parsed.username or parsed.password or parsed.port:
+            raise ValueError('File addresses must not contain credentials, ports, query parameters or fragments; '
+                             'encode literal # and ? in filenames as %23 and %3F')
+        text = unquote(parsed.path)
+        if parsed.netloc and parsed.netloc.casefold() != 'localhost':
+            text = '//' + parsed.netloc + text
+        if os.name == 'nt' and re.match(r'^/[A-Za-z]:/', text):
+            text = text[1:]
+    forward = text.replace('\\', '/')
+    if forward.casefold().startswith('//?/unc/'):
+        text = '//' + forward[8:]
+        forward = text
+    elif forward.startswith('//?/'):
+        text = forward[4:]
+        forward = text
+    if forward.startswith('//'):
+        if os.name != 'nt':
+            raise ValueError('UNC shares require a Windows dashboard host; on other systems use the mounted share path')
+        if len([part for part in forward[2:].split('/') if part]) < 3:
+            raise ValueError('UNC paths need a server, share and filename: \\\\server\\share\\history.sqlite3')
+    return Path(text).expanduser().resolve()
+
+
+def sqlite_readonly_uri(path):
+    """Keep UNC hosts in the path, avoiding SQLite's restricted URI authority."""
+    filename = dashboard_path(path).as_posix()
+    if not filename.startswith('/'):
+        filename = '/' + filename
+    # UNC becomes file:////server/share/file, with an empty URI authority.
+    return 'file://' + quote(filename, safe='/:') + '?mode=ro'
+
+
 def value_expr(column, fields):
     parts = []
     for field in fields:
@@ -41,7 +87,7 @@ def value_expr(column, fields):
 
 @contextmanager
 def connect(path, cfg=None):
-    db = sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True)
+    db = sqlite3.connect(sqlite_readonly_uri(path), uri=True)
     db.row_factory = sqlite3.Row
     try:
         # A consistent read across the several SELECTs used to build one view.

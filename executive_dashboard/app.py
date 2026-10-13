@@ -660,7 +660,7 @@ def main():
     with st.sidebar.expander('Data source'):
         database_text = st.text_input('History database', str(default_database))
         config_text = st.text_input('Configuration', str(default_config))
-    path, config_path = Path(database_text), Path(config_text)
+    path, config_path = data.history.dashboard_path(database_text), data.history.dashboard_path(config_text)
     if not path.is_file() or not config_path.is_file():
         st.info('Select an existing history database and configuration file.')
         return

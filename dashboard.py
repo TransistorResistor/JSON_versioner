@@ -515,7 +515,7 @@ def storage_health(path, snapshots):
 def main():
     st.title('How is the database changing?')
     st.caption('See where changes are happening, what changed, and when it happened across system types, groups and model owners.')
-    path = Path(st.sidebar.text_input('History database', str(ROOT / 'json_history' / 'history.sqlite3'))).resolve()
+    path = data.dashboard_path(st.sidebar.text_input('History database', str(ROOT / 'json_history' / 'history.sqlite3')))
     if not path.is_file():
         st.info('Create a snapshot first with version_json.py, or select an existing history database.')
         return
